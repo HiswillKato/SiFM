@@ -938,7 +938,7 @@ pre.out { border-radius: var(--bs-border-radius); border: 1px solid var(--bs-bor
     $hits = $q !== '' ? $fm->search($q, $scope) : [];
 ?>
 <div class="panel-head">
-  <form class="search-form d-flex" method="post" action="<? url('search', $folder) ?>">
+  <form class="search-form d-flex" method="post" action="<?= url('search', $folder) ?>">
     <div class="input-group">
       <input type="search" class="form-control" name="q" placeholder="Search — * and ? wildcards" value="<?= e($q) ?>" aria-label="Search" autofocus>
       <button class="btn btn-primary" type="submit"><?= icon('magnifying-glass') ?> Search</button>
