@@ -26,7 +26,7 @@ define('SIFM_MAX_IMPORT', 26214400);
 ## Soft delete: park deletions in .sifm-trash instead of unlinking them.
 ## true (default) makes every delete recoverable from the trash page;
 ## false restores the old behaviour — a delete is immediate and final.
-define('SIFM_TRASH', false);
+define('SIFM_TRASH', true);
 
 /**** Routing table — a query flag (?action&f=path) picks the page.
  **** A new page registers in three places: here, $title in dispatch, and the
