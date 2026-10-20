@@ -383,7 +383,6 @@ if ($action === 'signout') {
 $title = match (true) {
     $action === 'signin'    => 'Sign in',
     $action === 'folder'    => 'Folder: ' . ($listing !== '' ? $listing : '/'),
-    $action === 'search'    => get('q') !== '' ? 'Search: ' . get('q') : 'Search',
     $action === 'multi'     => ucfirst(post('action', 'items')),
     $action === 'trash'     => 'Trash',
     $action === 'about',
