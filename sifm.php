@@ -26,7 +26,7 @@ define('SIFM_MAX_IMPORT', 26214400);
 ## Soft delete: park deletions in .sifm-trash instead of unlinking them.
 ## true (default) makes every delete recoverable from the trash page;
 ## false restores the old behaviour — a delete is immediate and final.
-define('SIFM_TRASH', true);
+define('SIFM_TRASH', false);
 
 /**** Routing table — a query flag (?action&f=path) picks the page.
  **** A new page registers in three places: here, $title in dispatch, and the
@@ -1197,7 +1197,7 @@ pre.out { border-radius: var(--bs-border-radius); border: 1px solid var(--bs-bor
   <p class="text-secondary mb-0">The trash is empty.</p>
   <?php else: ?>
   <div class="table-responsive">
-    <table class="table align-middle mb-0">
+    <table class="table align-middle table-sm mb-0">
       <thead><tr><th>Name</th><th>Was at</th><th>Deleted</th><th class="text-end">Actions</th></tr></thead>
       <tbody>
 <?php foreach ($entries as $id => $one): ?>
