@@ -18,9 +18,14 @@ SiFM is an open-source, web-based PHP file manager that allows you to efficientl
 
 - **Copy, Move, and Rename**: Duplicate, relocate, or rename files and folders as needed, ensuring flexibility in organizing your data.
 
-- **Delete Files and Folders**: Permanently remove files or folders with confirmation to prevent accidental loss of important data. Deleted items cannot be recovered.
+- **Delete Files and Folders**: Move files or folders to the trash with a confirmation step to
+  prevent accidental loss of important data. Nothing is destroyed until you empty the trash —
+  and trash can be turned off in the config if you prefer immediate, permanent deletion.
 
 ### Advanced Features
+
+- **Trash**: Deletions are recoverable by default. Removed items wait in a hidden trash with
+  their original location remembered, so a restore puts them back exactly where they were.
 
 - **Permissions Management**: Change file and folder permissions (chmod) to control access, essential for multi-user environments.
 
@@ -51,6 +56,9 @@ You can customize various settings in the `sifm.php` configuration section:
 - **Admin Credentials**: Set the admin username and password (hashed for security).
 - **Home Folder**: Specify the base directory for file operations.
 - **Timezone**: Set the timezone for date and time display.
+- **Trash** (`SIFM_TRASH`, on by default): when enabled, deletions are recoverable — items
+  move to a hidden `.sifm-trash/` folder at the home root and can be restored from the trash
+  page until you empty it. Set it to `false` to make deletion immediate and final instead.
 
 ## Usage
 

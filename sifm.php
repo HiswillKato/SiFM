@@ -23,10 +23,10 @@ define('SIFM_MAX_EDIT', 2097152);
 ## Largest file the importer pulls from a URL (bytes)
 define('SIFM_MAX_IMPORT', 26214400);
 
-## Theme: dark is the default, the sifm_theme cookie overrides it.
-define('SIFM_THEME', in_array($_COOKIE[SIFM_ID . '_theme'] ?? '', ['dark', 'light'], true)
-    ? $_COOKIE[SIFM_ID . '_theme']
-    : 'dark');
+## Soft delete: park deletions in .sifm-trash instead of unlinking them.
+## true (default) makes every delete recoverable from the trash page;
+## false restores the old behaviour — a delete is immediate and final.
+define('SIFM_TRASH', true);
 
 /**** Routing table — a query flag (?action&f=path) picks the page.
  **** A new page registers in three places: here, $title in dispatch, and the
@@ -34,7 +34,7 @@ define('SIFM_THEME', in_array($_COOKIE[SIFM_ID . '_theme'] ?? '', ['dark', 'ligh
 $actions = [
     'signin', 'signout', 'folder', 'edit', 'source', 'backup', 'copy', 'move',
     'import', 'upload', 'create', 'download', 'delete', 'file', 'chmod',
-    'extract', 'rename', 'syntax', 'multi', 'search', 'dark', 'light',
+    'extract', 'rename', 'syntax', 'multi', 'search', 'trash',
 ];
 
 // Start a file manager instance
@@ -188,12 +188,35 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     case 'delete':
         if (post('del') !== '') {
-            if ($fm->delete($target)) {
-                message('Deletion successful!');
+            $done = keeps() ? $fm->trash($target) : $fm->delete($target);
+            if ($done) {
+                message(keeps() ? 'Moved to trash — restore it from the trash page.' : 'Deletion successful!');
             } else {
                 message('Deletion failed.', 0);
             }
             redirect('folder', dirname($target));
+        }
+        break;
+
+    case 'trash':
+        /* Restore one entry, or empty the whole trash for good. */
+        if (post('restore') !== '') {
+            $id = trim(post('id'));
+            if ($fm->restore($id)) {
+                message('Restored!');
+            } else {
+                message('Restore failed — something already occupies that path.', 0);
+            }
+            redirect('trash');
+        }
+        if (post('purge') !== '') {
+            $id = trim(post('id'));
+            if ($fm->purge($id !== '' ? $id : null)) {
+                message($id !== '' ? 'Entry destroyed.' : 'Trash emptied.');
+            } else {
+                message('Could not empty the trash.', 0);
+            }
+            redirect('trash');
         }
         break;
 
@@ -306,15 +329,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
             if ($kind === 'download') {
                 /* Build a ZIP in the home folder, stream it, delete it. */
-                $paths = [];
-                foreach ($items as $item) {
-                    $item = path($item);
-                    if ($item !== '') {
-                        $paths = [...$paths, ...$fm->collect(($folder !== '' ? $folder . '/' : '') . $item)];
-                    }
-                }
                 $tmp = '.sifm-' . bin2hex(random_bytes(6)) . '.zip';
-                if (!$fm->zip($paths, $tmp)) {
+                if (!$fm->backup($folder, $tmp, $items)) {
                     message('Could not build the ZIP archive.', 0);
                     redirect('folder', $folder);
                 }
@@ -328,7 +344,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
 
             if ($kind === 'backup') {
-                $ok = $fm->backup_array($folder, $dest, $items);
+                $ok = $fm->backup($folder, $dest, $items);
             } else {
                 $ok = true;
                 foreach ($items as $item) {
@@ -342,7 +358,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         'copy'   => $fm->copy($full, $dest . '/' . $item),
                         'move'   => $fm->move($full, $dest . '/' . $item),
                         'chmod'  => $fm->chmod($full, $dest),
-                        'delete' => $fm->delete($full),
+                        'delete' => keeps() ? $fm->trash($full) : $fm->delete($full),
                     } && $ok;
                 }
             }
@@ -362,10 +378,6 @@ if ($action === 'signout') {
     setcookie('SIFM_', '', time() - 3600, '/');
     redirect('signin');
 }
-if ($action === 'dark' || $action === 'light') {
-    cookie_set('theme', $action);
-    redirect('referer');
-}
 
 /**** Page title (register new pages here too). ****/
 $title = match (true) {
@@ -373,6 +385,7 @@ $title = match (true) {
     $action === 'folder'    => 'Folder: ' . ($listing !== '' ? $listing : '/'),
     $action === 'search'    => get('q') !== '' ? 'Search: ' . get('q') : 'Search',
     $action === 'multi'     => ucfirst(post('action', 'items')),
+    $action === 'trash'     => 'Trash',
     $action === 'about',
     $action === 'help'      => ucfirst($action),
     default                 => ucfirst($action) . ': /' . ($file !== '' ? $file : $folder),
@@ -384,7 +397,7 @@ $crumbs = $file !== '' ? ['path' => $file_folder, 'leaf' => basename($file)] : [
 ?>
 
 <!DOCTYPE html>
-<html lang="en" data-bs-theme="<?= SIFM_THEME ?>">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -394,9 +407,91 @@ $crumbs = $file !== '' ? ['path' => $file_folder, 'leaf' => basename($file)] : [
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:ital,wght@0,400;0,700;1,400&display=swap">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.7.2/css/all.min.css">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
+<?php /* CodeMirror 6 arrives through an import map so every bare @codemirror/*
+       and @lezer/* specifier resolves to ONE instance. jsdelivr's +esm bundles
+       each inline their own copy of @codemirror/state, which breaks the
+       editor's instanceof checks; esm.sh with ?deps= pinned to exact versions
+       emits absolute, shared dependency URLs instead — that is what keeps the
+       whole graph single-instance. Every package's deps list must name the same
+       versions, or a caret range sneaks a second copy back in. */
+$deps = '@codemirror/state@6.7.6,@codemirror/view@6.43.15,@codemirror/language@6.13.1,'
+    . '@lezer/common@1.5.3,@lezer/highlight@1.2.5,@lezer/lr@1.4.2,@lezer/php@1.0.2';
+$cm = [
+    '@codemirror/state'   => '6.7.6',
+    '@codemirror/view'    => '6.43.15',
+    '@codemirror/language' => '6.13.1',
+    '@codemirror/commands' => '6.11.1',
+    '@codemirror/search'  => '6.7.2',
+    '@lezer/highlight'    => '1.2.5',
+    '@lezer/common'       => '1.5.3',
+    '@lezer/lr'           => '1.4.2',
+    '@lezer/php'          => '1.0.2',
+];
+$packs = [
+    '@codemirror/lang-php'        => '6.0.2',
+    '@codemirror/lang-html'       => '6.4.12',
+    '@codemirror/lang-javascript' => '6.2.5',
+    '@codemirror/lang-css'        => '6.3.1',
+    '@codemirror/lang-json'       => '6.0.2',
+    '@codemirror/lang-markdown'   => '6.5.2',
+    '@codemirror/lang-python'     => '6.2.1',
+    '@codemirror/lang-sql'        => '6.10.0',
+    '@codemirror/lang-xml'        => '6.1.0',
+    '@codemirror/lang-yaml'       => '6.1.3',
+];
+$url = static fn(string $pkg, string $ver, string $extra = ''): string
+    => "https://esm.sh/{$pkg}@{$ver}{$extra}";
+/* Everything that must exist exactly once, as bare specifiers. Passing this to
+   ?external= stops a package from resolving its own copy: the emitted import
+   stays bare and lands on the SAME instance my module and every other package
+   use. A grammar that resolves @lezer/highlight on its own attaches tag objects
+   from a second copy, and highlightingFor() then answers null for every node —
+   the editor mounts and shows plain text. */
+$shared = implode(',', array_keys($cm));
+$map = [];
+foreach ($cm as $pkg => $ver) {
+    $bare = in_array($pkg, ['@codemirror/state', '@lezer/highlight', '@lezer/common', '@lezer/lr', '@lezer/php'], true);
+    $map[$pkg] = $url($pkg, $ver, $bare ? '' : "?deps={$deps}&external={$shared}");
+}
+foreach ($packs as $pkg => $ver) {
+    $map[$pkg] = $url($pkg, $ver, "?deps={$deps}&external={$shared}");
+}
+?>
+<script type="importmap">
+<?= json_encode(['imports' => $map], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) ?>
+</script>
 <?php if ($action === 'source'): ?>
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-<?= SIFM_THEME ?>.min.css">
+<link id="hljs" rel="stylesheet" data-base="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-">
 <?php endif; ?>
+<script>
+/* Theme — one switchboard for the whole page: the attribute Bootstrap's skin
+   hangs off, the highlight.js sheet, the header glyph and the editor's
+   re-theme hook. The stored choice wins; with none, the OS decides (auto).
+   This runs in <head>, before first paint, so nothing ever flashes. */
+const sifmTheme = (() => {
+  const key = '<?= SIFM_ID ?>_theme';
+  const os = matchMedia('(prefers-color-scheme: light)');
+  const read = () => {
+    const t = localStorage.getItem(key);
+    return t === 'dark' || t === 'light' ? t : (os.matches ? 'light' : 'dark');
+  };
+  const apply = (t = read()) => {
+    document.documentElement.dataset.bsTheme = t;
+    const hl = document.getElementById('hljs');
+    const css = hl && hl.dataset.base + t + '.min.css';
+    if (css && hl.getAttribute('href') !== css) hl.href = css;
+    const btn = document.getElementById('theme-toggle');
+    if (btn) {
+      btn.title = 'Switch to ' + (t === 'dark' ? 'light' : 'dark') + ' theme';
+      btn.querySelector('i').className = 'fas fa-' + (t === 'dark' ? 'sun' : 'moon');
+    }
+    if (window.__retheme) window.__retheme(t === 'dark');
+  };
+  apply();
+  os.addEventListener('change', () => { if (localStorage.getItem(key) === null) apply(); });
+  return { apply, flip: () => { const n = read() === 'dark' ? 'light' : 'dark'; localStorage.setItem(key, n); apply(n); } };
+})();
+</script>
 <style>
 /* ===========================================================================
    SiFM — "Bullion". A dark-first gold-on-graphite theme on Bootstrap 5.3.
@@ -607,6 +702,7 @@ html { --site-head-h: 3.4rem; }
    class, so every context shares it; each context only sizes its own circles. ---- */
 .icon-btn {
   display: inline-flex; align-items: center; justify-content: center;
+  padding: 0; background: none; /* the base must survive a <button>: no UA chrome */
   border: 1px solid var(--bs-border-color); border-radius: 999px;
   color: var(--bs-secondary-color);
   transition: color var(--snap), background-color var(--snap), border-color var(--snap);
@@ -683,15 +779,20 @@ pre.src .hljs-ln-numbers { user-select: none; text-align: right; color: var(--bs
 pre.src .hljs-ln-code { padding-left: 0.75rem; white-space: pre; }
 pre.src .hljs-ln-line { height: 1.6em; }
 pre.out { border-radius: var(--bs-border-radius); border: 1px solid var(--bs-border-color); background: var(--surface); padding: 1rem; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.86rem; }
-/* Editor: an Ace instance fills the box; the textarea below it is the
+/* Editor: a CodeMirror 6 instance fills the box; the textarea below it is the
    no-JS / no-network fallback and the form's actual field. Both share one
    viewport-driven height: it tracks the window, clamped so tiny and huge
    screens stay sane. */
-.ed, #editor { height: clamp(16rem, calc(100vh - 10.5rem), 68rem); height: clamp(16rem, calc(100dvh - 10.5rem), 68rem); }
+.cm-editor, #editor { height: clamp(16rem, calc(100vh - 10.5rem), 68rem); height: clamp(16rem, calc(100dvh - 10.5rem), 68rem); }
 .drop-zone { border: 2px dashed var(--bs-border-color); border-radius: var(--bs-border-radius); padding: 1.2rem; text-align: center; transition: border-color .15s, background-color .15s; }
 .drop-zone.drag-over { border-color: var(--bs-primary); background-color: rgba(var(--bs-primary-rgb), .08); }
 .drop-zone .form-control { max-width: 26rem; margin-inline: auto; }
 .ed { border: 1px solid var(--bs-border-color); border-radius: var(--bs-border-radius); overflow: hidden; }
+/* CodeMirror fills .ed and paints its own scrollbars; the gutter border and
+   theme colours arrive from the JS theme, so only the shell is styled here. */
+.ed .cm-editor { height: 100%; }
+.ed .cm-scroller { overflow: auto; font-family: var(--bs-font-monospace); font-size: 0.9rem; line-height: 1.6; }
+.ed .cm-gutters { border-right: 1px solid var(--bs-border-color); }
 
 .site-footer { color: var(--bs-secondary-color); font-size: 0.82rem; }
 @media (prefers-reduced-motion: reduce) {
@@ -712,28 +813,18 @@ pre.out { border-radius: var(--bs-border-radius); border: 1px solid var(--bs-bor
       </span>
     </a>
     <div class="header-tools">
-      <a class="icon-btn" id="theme-toggle" href="<?= url(SIFM_THEME === 'dark' ? 'light' : 'dark') ?>" title="Switch to <?= SIFM_THEME === 'dark' ? 'light' : 'dark' ?> theme" onclick="return flipTheme(this)">
-        <?= icon(SIFM_THEME === 'dark' ? 'sun' : 'moon') ?>
-      </a>
+      <?php if (keeps()): ?>
+      <a class="icon-btn" href="<?= url('trash') ?>" title="Trash"><?= icon('trash') ?></a>
+      <?php endif; ?>
+      <button type="button" class="icon-btn" id="theme-toggle" title="Switch to light theme" onclick="sifmTheme.flip()">
+        <?= icon('moon') ?>
+      </button>
       <a class="icon-btn" href="<?= url('signout') ?>" title="Sign out"
          onclick="return confirm('Are you sure you want to sign out?')"><?= icon('right-from-bracket') ?></a>
     </div>
   </div>
 </header>
-<script>
-/* Flip the theme in place: the page repaints instantly, the fetch lets the
-   server persist the HttpOnly cookie, and the editor re-themes if it is open. */
-function flipTheme(a) {
-  var next = document.documentElement.dataset.bsTheme === 'dark' ? 'light' : 'dark';
-  document.documentElement.dataset.bsTheme = next;
-  fetch(a.href);
-  a.href = a.href.slice(0, a.href.lastIndexOf('?') + 1) + next;
-  a.title = 'Switch to ' + next + ' theme';
-  a.querySelector('i').className = 'fas fa-' + (next === 'dark' ? 'sun' : 'moon');
-  if (window.__retheme) window.__retheme(next === 'dark');
-  return false;
-}
-</script>
+<script>sifmTheme.apply(); /* the markup above is dark-first: sync the glyph and title before paint */</script>
 <?php endif; ?>
 
 <main class="container-fluid px-3 px-md-4 py-4" style="max-width:1400px">
@@ -796,7 +887,7 @@ function flipTheme(a) {
     <a class="btn btn-ghost btn-sm text-danger" href="<?= url('delete', $folder) ?>"><?= icon('trash') ?> Delete</a>
     <?php endif; ?>
   </div>
-  <form class="search-form" method="post" action="<?= url('search', $f) ?>">
+  <form class="search-form" method="post" action="<?= url('search', $folder) ?>">
     <?= csrf_field(); ?>
     <div class="input-group">
       <input type="search" class="form-control" name="q" placeholder="Search — * and ? wildcards" value="<?= e(post('q')) ?>" aria-label="Search">
@@ -833,7 +924,7 @@ function flipTheme(a) {
       <option value="move">Move</option>
       <option value="chmod">Chmod</option>
       <option value="download">Download</option>
-      <option value="delete" onsubmit="return confirm('Are you sure you want to delete the selected items?');">Delete</option>
+      <option value="delete">Delete</option>
     </select>
     <input type="hidden" name="multi" value="1">
     <button class="btn btn-primary btn-sm" type="submit" name="submit" value="1">Go</button>
@@ -844,11 +935,11 @@ function flipTheme(a) {
 <?php case 'search': ?>
 <?php
     $q = trim(post('q'));
-    $scope = path($f);
+    $scope = path($folder);
     $hits = $q !== '' ? $fm->search($q, $scope) : [];
 ?>
 <div class="panel-head">
-  <form class="search-form d-flex" method="post" action="<? url('search',$f) ?>">
+  <form class="search-form d-flex" method="post" action="<? url('search', $folder) ?>">
     <div class="input-group">
       <input type="search" class="form-control" name="q" placeholder="Search — * and ? wildcards" value="<?= e($q) ?>" aria-label="Search" autofocus>
       <button class="btn btn-primary" type="submit"><?= icon('magnifying-glass') ?> Search</button>
@@ -1078,12 +1169,62 @@ function flipTheme(a) {
 <?php case 'delete': ?>
 <div class="card"><div class="card-body">
   <h1 class="h6 text-danger"><?= icon('triangle-exclamation') ?> Delete <?= is_dir(SIFM_HOME . '/' . $target) ? 'folder' : 'file' ?> &ldquo;<span class="mono">/<?= e($target) ?></span>&rdquo;?</h1>
-  <p class="text-secondary mb-3">This is irreversible — deleted items cannot be recovered.</p>
+  <p class="text-secondary mb-3"><?= keeps()
+      ? 'It moves to the trash — you can restore it from the <a href="' . url('trash') . '">trash page</a> until you empty the trash.'
+      : 'This is irreversible — deleted items cannot be recovered.' ?></p>
   <form method="post" action="<?= url('delete', $target) ?>" class="d-inline">
     <?= csrf_field() ?>
-    <button class="btn btn-danger" name="del" value="1" onclick="return confirm('Deleting is irreversible. Continue?')"><?= icon('check') ?> Yes, delete</button>
+    <button class="btn btn-danger" name="del" value="1"><?= icon('trash') ?> Yes, delete</button>
     <a class="btn btn-ghost" href="<?= url($file !== '' ? 'file' : 'folder', $file !== '' ? $file : dirname($target)) ?>">No, back</a>
   </form>
+</div></div>
+<?php break; ?>
+
+<?php case 'trash': ?>
+<?php $entries = $fm->trashed(); krsort($entries); ?>
+<div class="card"><div class="card-body">
+  <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3">
+    <h1 class="h6 mb-0"><?= icon('trash') ?> Trash <span class="text-secondary fw-normal">(<?= count($entries) ?> item<?= count($entries) === 1 ? '' : 's' ?>)</span></h1>
+    <?php if ($entries): ?>
+    <form method="post" action="<?= url('trash') ?>">
+      <?= csrf_field() ?>
+      <button class="btn btn-danger btn-sm" name="purge" value="1" onclick="return confirm('Destroy everything in the trash for good? This cannot be undone.')"><?= icon('fire') ?> Empty trash</button>
+    </form>
+    <?php endif; ?>
+  </div>
+
+  <?php if (!$entries): ?>
+  <p class="text-secondary mb-0">The trash is empty.</p>
+  <?php else: ?>
+  <div class="table-responsive">
+    <table class="table align-middle mb-0">
+      <thead><tr><th>Name</th><th>Was at</th><th>Deleted</th><th class="text-end">Actions</th></tr></thead>
+      <tbody>
+<?php foreach ($entries as $id => $one): ?>
+        <tr>
+          <td class="cell-name"><?= icon($one['dir'] ? 'folder' : 'file') ?> <span class="mono"><?= e(preg_replace('/^[^-]+-[^-]+-/', '', (string) $id)) ?></span></td>
+          <td class="mono text-secondary">/<?= e((string) ($one['from'] ?? '')) ?></td>
+          <td class="text-secondary"><?= e(date(SIFM_DATE, (int) ($one['at'] ?? 0))) ?></td>
+          <td class="text-end">
+            <div class="d-inline-flex gap-1">
+              <form method="post" action="<?= url('trash') ?>">
+                <?= csrf_field() ?>
+                <input type="hidden" name="id" value="<?= e((string) $id) ?>">
+                <button class="btn btn-ghost btn-sm" name="restore" value="1"><?= icon('rotate-left') ?> Restore</button>
+              </form>
+              <form method="post" action="<?= url('trash') ?>">
+                <?= csrf_field() ?>
+                <input type="hidden" name="id" value="<?= e((string) $id) ?>">
+                <button class="btn btn-ghost btn-sm text-danger" name="purge" value="1" onclick="return confirm('Destroy this for good?')"><?= icon('xmark') ?> Destroy</button>
+              </form>
+            </div>
+          </td>
+        </tr>
+<?php endforeach; ?>
+      </tbody>
+    </table>
+  </div>
+  <?php endif; ?>
 </div></div>
 <?php break; ?>
 
@@ -1283,6 +1424,11 @@ function flipTheme(a) {
     <li class="mono small py-1 border-bottom border-secondary border-opacity-25">/<?= e(($folder !== '' ? $folder . '/' : '') . $item) ?></li>
     <?php endforeach; ?>
   </ul>
+<?php if ($kind === 'delete'): ?>
+  <p class="text-secondary"><?= keeps()
+      ? 'The selected items move to the trash — restore them from the <a href="' . url('trash') . '">trash page</a> until you empty it.'
+      : 'This is irreversible — the selected items cannot be recovered.' ?></p>
+<?php endif; ?>
   <form method="post" action="<?= url('multi', $folder) ?>">
     <?= csrf_field() ?>
     <input type="hidden" name="action" value="<?= e($kind) ?>">
@@ -1299,7 +1445,7 @@ function flipTheme(a) {
 <?php endif; ?>
     <div class="d-flex gap-2">
       <?php if ($kind === 'delete'): ?>
-      <button class="btn btn-danger" name="submit" value="1" onclick="return confirm('Deleting is irreversible. Continue?')"><?= icon('check') ?> Yes, delete</button>
+      <button class="btn btn-danger" name="submit" value="1"><?= icon('trash') ?> Yes, delete</button>
       <?php elseif ($kind === 'download'): ?>
       <button class="btn btn-primary" name="submit" value="1"><?= icon('file-zipper') ?> Build &amp; download ZIP</button>
       <?php else: ?>
@@ -1329,103 +1475,143 @@ function toggleAll(box) {
 }
 </script>
 <?php if ($action === 'edit' && get('replace') !== '1'): ?>
-<script src="https://cdn.jsdelivr.net/npm/ace-builds@1.36.5/src-min-noconflict/ace.js"></script>
-<script>
-/* Bullion, in Ace — one inline theme per colour mode, nothing else to fetch.
-   If Ace never arrives, the hidden textarea below takes over unchanged. */
-(function () {
-  var ta = document.getElementById('editor');
-  if (!window.ace) { ta.hidden = false; return; }
+<?php
+    /* The editor's palette, straight off the design tokens — one map per
+       colour mode, so the JS theme and the PHP CSS can never drift apart. */
+    $ed = [
+        'dark' => ['bg' => 'var(--surface)', 'fg' => 'var(--bs-body-color)', 'gut' => 'var(--surface-2)', 'gut2' => '#242932', 'brd' => 'var(--bs-border-color)', 'mut' => 'var(--bs-secondary-color)', 'sel' => 'rgba(242,179,61,.22)', 'line' => 'var(--surface-2)', 'cur' => 'var(--bs-primary)', 'kw' => 'var(--bs-primary)', 'num' => 'var(--ember)', 'str' => 'var(--tok-string)', 'cm' => '#7d828b', 'tag' => 'var(--tok-def)', 'vd' => '#ff8a80', 'fn' => '#64b5f6'],
+        'light' => ['bg' => 'var(--surface)', 'fg' => 'var(--bs-body-color)', 'gut' => 'var(--surface-2)', 'gut2' => '#f6f3ec', 'brd' => 'var(--bs-border-color)', 'mut' => 'var(--bs-secondary-color)', 'sel' => 'rgba(154,111,12,.18)', 'line' => '#f7f6f2', 'cur' => 'var(--bs-primary)', 'kw' => 'var(--bs-primary)', 'num' => 'var(--ember)', 'str' => 'var(--tok-string)', 'cm' => '#6f6a5e', 'tag' => 'var(--tok-def)', 'vd' => '#c62828', 'fn' => '#1565c0'],
+    ];
+?>
+<script type="module">
+/* Bullion, in CodeMirror 6 — native ES modules straight from jsdelivr.
+   The textarea below stays the form's only real field: every edit is mirrored
+   into it, and if the CDN or the browser lets us down it simply stays visible. */
+const ta = document.getElementById('editor');
+const pals = <?= json_encode($ed) ?>;
+const fam = '<?= lang($ext) ?>';
+const dark = document.documentElement.dataset.bsTheme !== 'light';
 
-  /* Save in place: POST through fetch, show the verdict, refresh the mtime
-     guard — the page never moves. Anything but the Save button posts normally. */
-  var form = ta.form, flash;
-  form.addEventListener('submit', function (ev) {
+/* The palette, as CM6 theme and highlight style. Built per polarity from the
+   same tokens the rest of the page uses, so a theme flip is a compartment swap. */
+const theme = (p) => ({
+  '&': { backgroundColor: p.bg, color: p.fg, height: '100%' },
+  '.cm-content': { caretColor: p.cur },
+  '.cm-cursor, .cm-dropCursor': { borderLeftColor: p.cur },
+  '&.cm-focused .cm-selectionBackground, .cm-selectionBackground, .cm-content ::selection': { backgroundColor: p.sel },
+  '.cm-activeLine': { backgroundColor: p.line },
+  '.cm-gutters': { backgroundColor: p.gut, color: p.mut, border: 'none' },
+  '.cm-activeLineGutter': { backgroundColor: p.gut2 },
+  '.cm-panels': { backgroundColor: p.gut, color: p.fg },
+  '.cm-searchMatch': { backgroundColor: p.sel },
+});
+const style = (p, tags) => [
+  { tag: [tags.keyword, tags.moduleKeyword, tags.controlKeyword, tags.operatorKeyword], color: p.kw },
+  { tag: [tags.string, tags.special(tags.string), tags.regexp], color: p.str },
+  { tag: [tags.comment, tags.blockComment, tags.lineComment], color: p.cm, fontStyle: 'italic' },
+  { tag: [tags.number, tags.bool, tags.null, tags.atom], color: p.num },
+  { tag: [tags.tagName, tags.typeName, tags.className, tags.angleBracket], color: p.tag },
+  { tag: [tags.function(tags.variableName), tags.function(tags.propertyName)], color: p.fn },
+  { tag: [tags.definition(tags.variableName), tags.definition(tags.propertyName)], color: p.vd },
+  { tag: [tags.propertyName, tags.attributeName, tags.variableName], color: p.fg },
+];
+
+/* Save in place: POST through fetch, show the verdict, refresh the mtime
+   guard — the page never moves. Anything but Save posts normally. */
+const liveSave = (form) => {
+  let flash;
+  form.addEventListener('submit', (ev) => {
     if (!ev.submitter || ev.submitter.name !== 'save') return;
     ev.preventDefault();
     ev.submitter.disabled = true;
-    var fd = new FormData(form);
+    const fd = new FormData(form);
     fd.append('save', '1'); // FormData alone drops the submit button's pair
     fetch(form.action, { method: 'POST', body: fd, headers: { 'X-Requested-With': 'XMLHttpRequest' } })
-      .then(function (r) { return r.json(); })
-      .then(function (d) {
+      .then((r) => r.json())
+      .then((d) => {
         ev.submitter.disabled = false;
-        var m = form.querySelector('[name=mtime]');
+        const m = form.querySelector('[name=mtime]');
         if (d.ok && m && d.mtime) m.value = d.mtime; // conflict keeps the stale mtime, so a blind retry can never overwrite
-        if (!flash) { flash = document.createElement('div'); form.prepend(flash); }
+        flash = flash || form.insertBefore(document.createElement('div'), form.firstChild);
         flash.className = 'alert alert-' + (d.ok ? 'success' : 'danger') + ' mt-2';
         flash.textContent = d.msg;
-        setTimeout(function () { flash.remove(); flash = null; }, 4000);
+        setTimeout(() => { flash.remove(); flash = null; }, 4000);
       })
-      .catch(function () { ev.submitter.disabled = false; });
+      .catch(() => { ev.submitter.disabled = false; });
   });
+};
 
-  function bullion(dark, t) {
-    var c = 'ace-sifm-' + (dark ? 'dark' : 'light'); // one id per polarity — Ace dedupes themes by id
-    return {
-      isDark: dark,
-      cssClass: c,
-      cssText: '.' + c + '{background:' + t.bg + ';color:' + t.fg + '}'
-        + '.' + c + ' .ace_gutter{background:' + t.gut + ';color:' + t.mut + ';border-right:1px solid ' + t.brd + '}'
-        + '.' + c + ' .ace_gutter-active-line{background:' + t.gut2 + '}'
-        + '.' + c + ' .ace_marker-layer .ace_selection{background:' + t.sel + '}'
-        + '.' + c + ' .ace_active-line{background:' + t.line + '}'
-        + '.' + c + ' .ace_cursor{border-left-color:' + t.cur + '}'
-        + '.' + c + ' .ace_keyword,.' + c + ' .ace_meta,.' + c + ' .ace_storage{color:' + t.kw + '}'
-        + '.' + c + ' .ace_constant.ace_number{color:' + t.num + '}'
-        + '.' + c + ' .ace_string{color:' + t.str + '}'
-        + '.' + c + ' .ace_comment{color:' + t.cm + ';font-style:italic}'
-        + '.' + c + ' .ace_entity,.' + c + ' .ace_entity.ace_name.ace_tag,.' + c + ' .ace_support.ace_tag{color:' + t.tag + '}'
-        + '.' + c + ' .ace_variable{color:' + t.vd + '}'
-        + '.' + c + ' .ace_function,.' + c + ' .ace_entity.ace_name{color:' + t.fn + '}'
-    };
-  }
-  var pals = {
-    dark:  { bg: '#171a20', gut: '#1e222a', gut2: '#242932', brd: 'rgba(255,255,255,.11)', fg: '#d4d7dd', mut: 'rgba(212,215,221,.55)', sel: 'rgba(242,179,61,.22)', line: '#1e222a', cur: '#f2b33d', kw: '#f2b33d', num: '#ff8f3f', str: '#9fd08a', cm: '#7d828b', tag: '#ffcf80', vd: '#ff8a80', fn: '#64b5f6' },
-    light: { bg: '#ffffff', gut: '#f1efe8', gut2: '#f6f3ec', brd: 'rgba(23,21,15,.14)', fg: '#2a2721', mut: 'rgba(42,39,33,.5)', sel: 'rgba(154,111,12,.18)', line: '#f7f6f2', cur: '#9a6f0c', kw: '#9a6f0c', num: '#d96a26', str: '#2e7d32', cm: '#6f6a5e', tag: '#9a4d0c', vd: '#c62828', fn: '#1565c0' }
-  };
-  var dark = <?= SIFM_THEME === 'dark' ? 'true' : 'false' ?>;
-  var pal = pals[dark ? 'dark' : 'light'];
-  var theme = bullion(dark, pal);
-  var lang = '<?= lang($ext) ?>';
+/* [bare specifier, exported factory] for the curated grammars, [mode file,
+   parser] for the stream parsers. PHP's family comes from lang(). */
+const curated = {
+  php:  ['@codemirror/lang-php', 'php'],
+  xml:  ['@codemirror/lang-xml', 'xml'],
+  js:   ['@codemirror/lang-javascript', 'javascript'],
+  css:  ['@codemirror/lang-css', 'css'],
+  md:   ['@codemirror/lang-markdown', 'markdown'],
+  sql:  ['@codemirror/lang-sql', 'sql'],
+  py:   ['@codemirror/lang-python', 'python'],
+};
+const streams = { sh: ['shell', 'shell'], ruby: ['ruby', 'ruby'], perl: ['perl', 'perl'] };
+const legacy = (file) => import(`https://cdn.jsdelivr.net/npm/@codemirror/legacy-modes@6.5.5/mode/${file}.js`);
 
-  /* Ace's PHP rules leave declared names as plain `identifier`, which no CSS
-     can single out — so teach the tokenizer `function <name>` and give the
-     name entity.name.function, which the theme paints with the fn colour. */
-  function patch() {
-    if (lang === 'plain') return;
-    var s = window.__ed.session, m = s.getMode();
-    m.getTokenizer(); // ensure the highlight rules exist
-    m.$highlightRules.getRules().start.unshift({
-      token: ['storage.type', 'text', 'entity.name.function'],
-      regex: '(function)(\\s+)(\\w+)'
-    });
-    m.$tokenizer = null; // drop the tokenizer built from the old rules
-    s.bgTokenizer.setTokenizer(m.getTokenizer()); // rebuild + re-tokenize all rows
-  }
+try {
+  const [state, view, language, commands, search, lezer] = await Promise.all([
+    import('@codemirror/state'),
+    import('@codemirror/view'),
+    import('@codemirror/language'),
+    import('@codemirror/commands'),
+    import('@codemirror/search'),
+    import('@lezer/highlight'),
+  ]);
+  const { EditorState, Compartment } = state;
+  const { EditorView, keymap, lineNumbers, drawSelection, highlightActiveLine, highlightActiveLineGutter } = view;
+  const { syntaxHighlighting, HighlightStyle, StreamLanguage, LanguageSupport } = language;
+  const { defaultKeymap, history, historyKeymap, indentWithTab } = commands;
+  const { searchKeymap, openSearchPanel } = search;
+  const { tags } = lezer;
 
-  try {
-    var ed = ace.edit('ed');
-    window.__ed = ed;
-    ed.setTheme(theme);
-    var mode = { js: 'javascript', md: 'markdown', py: 'python', sh: 'sh', ini: 'ini', clike: 'c_cpp', plain: 'text' }[lang] || lang;
-    ed.session.setMode('ace/mode/' + mode, patch);
-    ed.session.setUseWorker(false);
-    ed.session.setUseWrapMode(true);
-    ed.session.setTabSize(4);
-    ed.session.setValue(ta.value);
-    ed.session.on('change', function () { ta.value = ed.getValue(); });
-  } catch (e) {
-    document.getElementById('ed').remove();
-    ta.hidden = false;
+  let grammar = [];
+  if (fam in curated) {
+    const [pkg, name] = curated[fam];
+    grammar = (await import(pkg))[name]();
+  } else if (fam in streams) {
+    const [file, name] = streams[fam];
+    grammar = new LanguageSupport(StreamLanguage.define((await legacy(file))[name]));
+  } else if (fam === 'ini') {
+    grammar = new LanguageSupport(StreamLanguage.define((await legacy('properties')).properties));
+  } else if (fam === 'clike') {
+    grammar = new LanguageSupport(StreamLanguage.define((await legacy('clike')).cpp));
   }
 
-  /* The header's flipTheme() calls this so the open editor repaints at once. */
-  window.__retheme = function (d) {
-    pal = pals[d ? 'dark' : 'light'];
-    if (window.__ed) window.__ed.setTheme(bullion(d, pal));
-  };
-})();
+  const pal = new Compartment();
+  const paint = (p) => [EditorView.theme(theme(p)), syntaxHighlighting(HighlightStyle.define(style(p, tags)))];
+
+  const editor = new EditorView({
+    parent: document.getElementById('ed'),
+    state: EditorState.create({
+      doc: ta.value,
+      extensions: [
+        lineNumbers(), history(), drawSelection(), highlightActiveLine(), highlightActiveLineGutter(),
+        EditorView.lineWrapping, EditorState.tabSize.of(4), EditorView.updateListener.of((u) => { if (u.docChanged) ta.value = u.state.doc.toString(); }),
+        keymap.of([...defaultKeymap, ...historyKeymap, ...searchKeymap, indentWithTab]),
+        pal.of(paint(pals[dark ? 'dark' : 'light'])),
+        grammar,
+      ],
+    }),
+  });
+  liveSave(ta.form);
+
+  /* CM6 ships its own find & replace panel — Ctrl/Cmd+F opens it. */
+  EditorView.domEventHandlers({ keydown: (ev) => ((ev.ctrlKey || ev.metaKey) && ev.key === 'f' ? openSearchPanel(editor) || true : false) });
+
+  /* sifmTheme.apply() hands this the new polarity so the open editor repaints at once. */
+  window.__retheme = (dark) => editor.dispatch({ effects: pal.reconfigure(paint(pals[dark ? 'dark' : 'light'])) });
+} catch (err) {
+  document.getElementById('ed').remove();
+  ta.hidden = false;
+  window.__err = String(err && err.stack || err); // visible to the smoke probe and DevTools
+}
 </script>
 <?php endif; ?>
 <?php if ($action === 'source'): ?>
@@ -1479,6 +1665,14 @@ function post(string $key, string $default = ''): string
     return is_string($v) ? $v : $default;
 }
 
+/** Is soft delete on? The one place deletion decides between parking an item
+ *  in the trash and unlinking it — every delete site reads this, so flipping
+ *  SIFM_TRASH cannot leave one path still trashing behind the other's back. */
+function keeps(): bool
+{
+    return SIFM_TRASH;
+}
+
 /** Build ?action&f=path — the whole router. The item runs through path(),
  *  so a link never carries a leading/trailing slash or a "." segment, and
  *  the root folder drops ?f= entirely. */
@@ -1490,20 +1684,10 @@ function url(string $action, ?string $item = null): string
         : $_SERVER['DOCUMENT_URI'] . '?' . rawurlencode($action);
 }
 
-/** PRG helper. 'referer' reopens the previous page, but only if it is
- *  on this host — a foreign Referer falls back to the home folder. */
+/** PRG helper: the browser always lands on a clean GET. */
 function redirect(string $action, ?string $item = ''): void
 {
-    if ($action === 'referer') {
-        $ref = $_SERVER['HTTP_REFERER'] ?? '';
-        $mine = parse_url('http://' . ($_SERVER['HTTP_HOST'] ?? ''), PHP_URL_HOST);
-        $link = ($ref !== '' && parse_url($ref, PHP_URL_HOST) === $mine)
-            ? $ref
-            : url('folder');
-    } else {
-        $link = url($action, $item);
-    }
-    header('Location: ' . $link, true, 302);
+    header('Location: ' . url($action, $item), true, 302);
     exit;
 }
 
@@ -1549,18 +1733,6 @@ function csrf_field(): string
 function csrf_ok(): bool
 {
     return hash_equals(csrf(), post('csrf'));
-}
-
-/** Theme cookie. Host-only (no domain), SameSite=Lax, HttpOnly. */
-function cookie_set(string $name, string $value): void
-{
-    setcookie(SIFM_ID . '_' . $name, $value, [
-        'expires'  => time() + 604800 * 4,
-        'path'     => '/',
-        'httponly' => true,
-        'samesite' => 'Lax',
-        'secure'   => !empty($_SERVER['HTTPS']),
-    ]);
 }
 
 /** True when the request came in through fetch() from our own pages. */
@@ -1833,6 +2005,98 @@ class fm
         return rename($this->abs($from), $this->abs($dest));
     }
 
+    /** Name of the hidden folder deletions are parked in, at the home root. */
+    const trash = '.sifm-trash';
+
+    /** Manifest inside the trash: entry id → the path it came from, so a
+     *  restore can put it back exactly where it was. */
+    private function manifest(): string
+    {
+        return $this->abs(self::trash . '/.manifest.json');
+    }
+
+    /** Park a file or folder in the trash instead of unlinking it: one atomic
+     *  rename, the original path remembered, nothing recursive to go wrong. */
+    public function trash(string $target): bool
+    {
+        $target = path($target);
+        if ($target === '' || !file_exists($this->abs($target))) {
+            return false;
+        }
+        /* Never take the trash itself, and never take the home root. */
+        if ($target === self::trash || str_starts_with($target, self::trash . '/')) {
+            return false;
+        }
+        if (!is_dir($this->abs(self::trash)) && !mkdir($this->abs(self::trash), 0755, true)) {
+            return false;
+        }
+        /* id is unique by time + randomness: the name the item carries in the
+           trash, so two deletes of the same filename never collide. */
+        $id = date('Ymd-His') . '-' . bin2hex(random_bytes(4)) . '-' . basename($target);
+        if (!rename($this->abs($target), $this->abs(self::trash . '/' . $id))) {
+            return false;
+        }
+        $map = $this->trashed();
+        $map[$id] = ['from' => $target, 'at' => time(), 'dir' => $this->isfolder(self::trash . '/' . $id)];
+        file_put_contents($this->manifest(), json_encode($map, JSON_PRETTY_PRINT));
+        return true;
+    }
+
+    /** The manifest, oldest first. An unreadable or absent file reads as empty. */
+    public function trashed(): array
+    {
+        $raw = @file_get_contents($this->manifest());
+        $map = $raw ? json_decode($raw, true) : [];
+        return is_array($map) ? $map : [];
+    }
+
+    /** Put one entry back where it came from. Refuses if that path is now
+     *  taken — a restore must never overwrite whatever moved in since. */
+    public function restore(string $id): bool
+    {
+        $map = $this->trashed();
+        if (!isset($map[$id])) {
+            return false;
+        }
+        $from = (string) ($map[$id]['from'] ?? '');
+        $parked = self::trash . '/' . $id;
+        if ($from === '' || !file_exists($this->abs($parked))) {
+            return false;
+        }
+        if (file_exists($this->abs($from))) {
+            return false;
+        }
+        $dest_dir = dirname($from);
+        if ($dest_dir !== '.' && !$this->isfolder($dest_dir) && !$this->create($dest_dir, true)) {
+            return false;
+        }
+        if (!rename($this->abs($parked), $this->abs($from))) {
+            return false;
+        }
+        unset($map[$id]);
+        file_put_contents($this->manifest(), json_encode($map, JSON_PRETTY_PRINT));
+        return true;
+    }
+
+    /** Destroy one entry for good, or the whole trash with $all. */
+    public function purge(?string $id = null): bool
+    {
+        $map = $this->trashed();
+        $ids = $id === null ? array_keys($map) : [$id];
+        $ok = true;
+        foreach ($ids as $one) {
+            $parked = self::trash . '/' . $one;
+            if (file_exists($this->abs($parked)) && !$this->delete($parked)) {
+                $ok = false;
+                continue;
+            }
+            unset($map[$one]);
+        }
+        file_put_contents($this->manifest(), json_encode($map, JSON_PRETTY_PRINT));
+        return $ok;
+    }
+
+    /** Delete for real — recursive unlink. The trash uses this to empty out. */
     public function delete(string $target): bool
     {
         $target = path($target);
@@ -1886,25 +2150,26 @@ class fm
         return $closed && $ok;
     }
 
-    public function backup(string $folder, string $name = ''): bool
+    /** Zip a whole folder — or just $items picked from it — into $name.
+     *  Leave $items out to back up everything under $folder. */
+    public function backup(string $folder, string $name = '', ?array $items = null): bool
     {
         $folder = path($folder);
         $name = $name !== '' ? $name : 'Backup-' . date('YmdHis') . '.zip';
-        return $this->zip($this->collect($folder), $name);
-    }
-
-    /** Backup several items of one folder into a single zip. */
-    public function backup_array(string $folder, string $name, array $items): bool
-    {
-        $folder = path($folder);
-        $name = $name !== '' ? $name : 'Backup-' . date('YmdHis') . '.zip';
-        $paths = [];
-        foreach ($items as $item) {
-            $item = path((string) $item);
-            if ($item === '') {
-                continue;
+        $base = $folder !== '' ? $folder . '/' : '';
+        $targets = [$folder];
+        if ($items !== null) {
+            $targets = [];
+            foreach ($items as $item) {
+                $item = path((string) $item);
+                if ($item !== '') {
+                    $targets[] = $base . $item;
+                }
             }
-            $paths = [...$paths, ...$this->collect(($folder !== '' ? $folder . '/' : '') . $item)];
+        }
+        $paths = [];
+        foreach ($targets as $target) {
+            $paths = [...$paths, ...$this->collect($target)];
         }
         return $this->zip($paths, $name);
     }
