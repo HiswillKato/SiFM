@@ -1,6 +1,6 @@
 <?php
 
-/**** SiFM — single-file file manager. Configuration. ****/
+/**** SiFM — Simple File Manager  Configuration. ****/
 
 ## Display name / version / session-cookie id
 define('SIFM_NAME', 'SiFM');
@@ -23,18 +23,24 @@ define('SIFM_MAX_EDIT', 2097152);
 ## Largest file the importer pulls from a URL (bytes)
 define('SIFM_MAX_IMPORT', 26214400);
 
-## Soft delete: park deletions in .sifm-trash instead of unlinking them.
-## true (default) makes every delete recoverable from the trash page;
-## false restores the old behaviour — a delete is immediate and final.
-define('SIFM_TRASH', true);
-
 /**** Routing table — a query flag (?action&f=path) picks the page.
  **** A new page registers in three places: here, $title in dispatch, and the
  **** render switch at the bottom. Missing any one silently falls back home. ****/
 $actions = [
     'signin', 'signout', 'folder', 'edit', 'source', 'backup', 'copy', 'move',
     'import', 'upload', 'create', 'download', 'delete', 'file', 'chmod',
-    'extract', 'rename', 'syntax', 'multi', 'search', 'trash',
+    'extract', 'rename', 'syntax', 'multi', 'search', 'duplicate', 'clip',
+    'paste', 'image',
+];
+
+/**** The multi-select actions: the key is the kind, the label is what the
+ **** select and the button show. The select, the validation and the handler
+ **** all read this one list. ****/
+$kinds = [
+    'backup' => 'Backup', 'copy' => 'Copy to…', 'move' => 'Move to…',
+    'chmod' => 'Chmod', 'download' => 'Download ZIP', 'delete' => 'Delete',
+    'pick' => 'Copy to clipboard', 'cut' => 'Cut to clipboard',
+    'rename' => 'Rename with a pattern',
 ];
 
 // Start a file manager instance
@@ -50,7 +56,7 @@ foreach ($actions as $flag) {
 }
 
 session_cache_limiter('nocache');
-session_name('SIFM_');
+session_name(SIFM_ID);
 session_set_cookie_params([
     'lifetime' => 0,
     'path'     => '/',
@@ -94,8 +100,8 @@ $target = $file !== '' ? $file : $folder;
  **** outgrows it ("headers already sent" in the FPM log, half a page in the
  **** browser). Every "this URL makes no sense" redirect therefore lives
  **** here, before the first byte: views may only ever render. ****/
-$needs_item = ['chmod', 'copy', 'move', 'rename', 'delete'];
-$needs_file = ['file', 'edit', 'source', 'syntax', 'extract'];
+$needs_item = ['chmod', 'copy', 'move', 'rename', 'delete', 'duplicate'];
+$needs_file = ['file', 'edit', 'source', 'syntax', 'extract', 'image'];
 if (in_array($action, $needs_item, true) && $target === '') {
     redirect('folder');
 }
@@ -113,13 +119,42 @@ if ($action === 'edit') {
         redirect('file', $file);
     }
 }
+if ($action === 'image') {
+    if (!@getimagesize(SIFM_HOME . '/' . $file)) {
+        message('That file is not an image.', 2);
+        redirect('file', $file);
+    }
+    if (!$fm->writable($file)) {
+        message('File is not writable — chmod it first, then edit.', 0);
+        redirect('file', $file);
+    }
+}
 if ($action === 'multi') {
     $kind = post('action');
     $items = array_values(array_filter((array) ($_POST['items'] ?? []), 'is_string'));
-    if (!in_array($kind, ['backup', 'copy', 'move', 'chmod', 'delete', 'download'], true) || !$items) {
+    if (!isset($kinds[$kind]) || !$items) {
         message('Nothing selected.', 2);
         redirect('folder', $folder);
     }
+}
+/* Nothing to paste without a clipboard. */
+if ($action === 'paste' && empty($_SESSION['clip'])) {
+    redirect('folder', $folder);
+}
+/* Listing preferences — the sort bar posts them, they live in the session, so
+   every link on the page keeps them without a query string. */
+if ($action === 'folder' && post('sort') !== '') {
+    if (post('reset') !== '') {
+        unset($_SESSION['listing']); // back to the defaults
+    } else {
+        $_SESSION['listing'] = [
+            'sort' => in_array(post('sort'), ['name', 'size', 'date', 'type'], true) ? post('sort') : 'name',
+            'dir' => post('dir') === 'desc' ? 'desc' : 'asc',
+            'hidden' => post('hidden') === '1' ? '1' : '0',
+            'ext' => path(post('ext')),
+        ];
+    }
+    redirect('folder', $folder);
 }
 
 /**** POST handlers — each processes only if its own button was pressed,
@@ -150,73 +185,38 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
         break;
 
-    case 'chmod':
-        if (post('mod') !== '') {
-            if ($fm->chmod($target, trim(post('mod')))) {
-                message('Chmod successful!');
-            } else {
-                message('Chmod failed — use 3–4 octal digits like 644.', 0);
-            }
+    case 'chmod': case 'copy': case 'move': case 'rename': case 'delete': case 'duplicate': {
+        /* The five single-item actions differ only in the button that fires
+         * them, the two messages and the call itself — one row each, one body.
+         * They all land back in the item's own folder. */
+        $ops = [
+            'copy'   => ['copy', 'Copy successful!',     'Failed to copy.',                                  fn($t) => $fm->copy($t, path(post('new')))],
+            'move'   => ['move', 'Moving successful!',   'Moving failed.',                                   fn($t) => $fm->move($t, path(post('new')))],
+            'rename' => ['ren',  'Renaming successful!', 'Renaming failed — no slashes in the new name.',     fn($t) => $fm->rename($t, trim(post('new')))],
+            'chmod'  => ['mod',  'Chmod successful!',    'Chmod failed — use 3–4 octal digits like 644.',      fn($t) => $fm->chmod($t, trim(post('mod')))],
+            'delete' => ['del',  'Deletion successful!', 'Deletion failed.',                                  fn($t) => $fm->delete($t)],
+            'duplicate' => ['dup', 'Duplicated!', 'Duplication failed.',                               fn($t) => $fm->copy($t, rel(dirname($t), path(post('new'))))],
+        ];
+        [$btn, $ok, $err, $run] = $ops[$action];
+        if (post($btn) !== '') {
+            $done = $run($target);
+            message($done ? $ok : $err, $done ? 1 : 0);
             redirect('folder', dirname($target));
         }
         break;
-
-    case 'copy':
-        if (post('copy') !== '') {
-            if ($fm->copy($target, path(post('new')))) {
-                message('Copy successful!');
-            } else {
-                message('Failed to copy.', 0);
-            }
-            redirect('folder', dirname($target));
-        }
-        break;
+    }
 
     case 'create':
         if (post('create') !== '') {
             $name = path(post('i'));
             if ($name === '') {
                 message('Invalid name.', 0);
-            } elseif ($fm->create(($listing !== '' ? $listing . '/' : '') . $name, post('folder') === '1')) {
+            } elseif ($fm->create(rel($listing, $name), post('folder') === '1')) {
                 message('Creation successful!');
             } else {
                 message('Failed to create.', 0);
             }
             redirect('folder', $listing);
-        }
-        break;
-
-    case 'delete':
-        if (post('del') !== '') {
-            $done = keeps() ? $fm->trash($target) : $fm->delete($target);
-            if ($done) {
-                message(keeps() ? 'Moved to trash — restore it from the trash page.' : 'Deletion successful!');
-            } else {
-                message('Deletion failed.', 0);
-            }
-            redirect('folder', dirname($target));
-        }
-        break;
-
-    case 'trash':
-        /* Restore one entry, or empty the whole trash for good. */
-        if (post('restore') !== '') {
-            $id = trim(post('id'));
-            if ($fm->restore($id)) {
-                message('Restored!');
-            } else {
-                message('Restore failed — something already occupies that path.', 0);
-            }
-            redirect('trash');
-        }
-        if (post('purge') !== '') {
-            $id = trim(post('id'));
-            if ($fm->purge($id !== '' ? $id : null)) {
-                message($id !== '' ? 'Entry destroyed.' : 'Trash emptied.');
-            } else {
-                message('Could not empty the trash.', 0);
-            }
-            redirect('trash');
         }
         break;
 
@@ -237,7 +237,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     case 'import':
         if (post('url') !== '') {
             $name = basename(trim(post('name')) ?: (string) (parse_url(post('url'), PHP_URL_PATH) ?: 'imported')) ?: 'imported';
-            $why  = $fm->import(trim(post('url')), ($folder !== '' ? $folder . '/' : '') . $name);
+            $why  = $fm->import(trim(post('url')), rel($folder, $name));
             $ok   = $why === null;
             json_out(['ok' => $ok, 'msg' => $ok ? "Imported {$name}!" : $why]);
             message($ok ? "Imported {$name}!" : $why, $ok ? 1 : 0);
@@ -323,6 +323,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         break;
 
     case 'multi':
+        if (in_array($kind, ['pick', 'cut'], true)) {
+            redirect('folder', $folder); // the clipboard kinds post to the clip action
+        }
         if (post('submit') !== '') {
             $dest = path(post('dest'));
             $ok = false;
@@ -347,18 +350,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $ok = $fm->backup($folder, $dest, $items);
             } else {
                 $ok = true;
-                foreach ($items as $item) {
+                foreach ($items as $n => $item) {
                     $item = path($item);
                     if ($item === '') {
                         $ok = false;
                         continue;
                     }
-                    $full = ($folder !== '' ? $folder . '/' : '') . $item;
+                    $full = rel($folder, $item);
                     $ok = match ($kind) {
                         'copy'   => $fm->copy($full, $dest . '/' . $item),
                         'move'   => $fm->move($full, $dest . '/' . $item),
                         'chmod'  => $fm->chmod($full, $dest),
-                        'delete' => keeps() ? $fm->trash($full) : $fm->delete($full),
+                        'delete' => $fm->delete($full),
+                        'rename' => $fm->rename($full, rename_pattern($dest, $item, $n + 1)),
                     } && $ok;
                 }
             }
@@ -366,6 +370,57 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             redirect('folder', $folder);
         }
         break; // no "submit": fall through to the confirmation screen below
+
+    case 'clip':
+        /* The clipboard: items staged for a later paste. $mode is copy or cut,
+           $from is the folder they live in. */
+        $mode = post('mode') === 'cut' ? 'cut' : 'copy';
+        $staged = array_values(array_filter(array_map('path', array_filter((array) ($_POST['items'] ?? []), 'is_string'))));
+        if (!$staged) {
+            message('Nothing to copy.', 2);
+            redirect('folder', $folder);
+        }
+        $_SESSION['clip'] = ['mode' => $mode, 'from' => $folder, 'items' => $staged];
+        message(($mode === 'cut' ? 'Cut ' : 'Copied ') . count($staged) . ' item(s) — paste them where they belong.');
+        redirect('folder', $folder);
+        break;
+
+    case 'paste':
+        $clip = $_SESSION['clip'] ?? null;
+        $done = 0;
+        $left = [];
+        foreach ($clip['items'] as $item) {
+            $src = rel($clip['from'], $item);
+            $dst = rel($folder, $item);
+            if ($src === $dst || $fm->exists($dst)) {
+                $left[] = $item; // same folder, or the name is taken
+                continue;
+            }
+            $ok = $clip['mode'] === 'cut' ? $fm->move($src, $dst) : $fm->copy($src, $dst);
+            if ($ok) {
+                $done++;
+            } else {
+                $left[] = $item;
+            }
+        }
+        if ($clip['mode'] === 'cut') {
+            unset($_SESSION['clip']); // a cut is spent
+        }
+        $text = $done > 0 ? 'Pasted ' . $done . ' item(s).' : 'Nothing pasted.';
+        if ($left) {
+            $text .= ' Left alone: ' . implode(', ', $left) . '.';
+        }
+        message($text, $done > 0 ? 1 : 0);
+        redirect('folder', $folder);
+        break;
+
+    case 'image':
+        if (post('op') !== '') {
+            $what = $fm->image($file, post('op'), (int) post('w'));
+            message($what ?? 'The image tool failed.', $what !== null ? 1 : 0);
+            redirect('file', $file);
+        }
+        break;
     }
 }
 
@@ -384,17 +439,30 @@ $title = match (true) {
     $action === 'signin'    => 'Sign in',
     $action === 'folder'    => 'Folder: ' . ($listing !== '' ? $listing : '/'),
     $action === 'multi'     => ucfirst(post('action', 'items')),
-    $action === 'trash'     => 'Trash',
-    $action === 'about',
-    $action === 'help'      => ucfirst($action),
     default                 => ucfirst($action) . ': /' . ($file !== '' ? $file : $folder),
 };
 
-/* Context for the breadcrumb bar. */
-$crumbs = $file !== '' ? ['path' => $file_folder, 'leaf' => basename($file)] : ['path' => $folder, 'leaf' => ''];
+/* The actions the toolbar shows and the command palette offers — one list,
+ * two views: [label, icon, url, key, extra class]. The key is the single-key
+ * shortcut; delete gets none, a stray keystroke must never destroy anything. */
+$tools = [
+    ['Create', 'circle-plus', url('create', $listing), 'n', ''],
+    ['Upload', 'upload', url('upload', $listing), 'u', ''],
+    ['Import', 'cloud-arrow-down', url('import', $listing), 'i', ''],
+    ['Backup', 'suitcase', url('backup', $listing), 'b', ''],
+];
+if ($action === 'folder' && $folder !== '') {
+    $tools[] = ['Copy', 'copy', url('copy', $folder), 'c', ''];
+    $tools[] = ['Move', 'exchange', url('move', $folder), 'm', ''];
+    $tools[] = ['Rename', 'pencil', url('rename', $folder), 'r', ''];
+    $tools[] = ['Delete', 'trash', url('delete', $folder), '', 'text-danger'];
+}
+if (!empty($_SESSION['clip'])) {
+    $tools[] = ['Paste here', 'paste', url('paste', $listing), 'p', ''];
+}
+$palette = array_merge([['Home folder', 'house', url('folder'), 'h', '']], $tools);
 
 ?>
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -484,7 +552,6 @@ const sifmTheme = (() => {
       btn.title = 'Switch to ' + (t === 'dark' ? 'light' : 'dark') + ' theme';
       btn.querySelector('i').className = 'fas fa-' + (t === 'dark' ? 'sun' : 'moon');
     }
-    if (window.__retheme) window.__retheme(t === 'dark');
   };
   apply();
   os.addEventListener('change', () => { if (localStorage.getItem(key) === null) apply(); });
@@ -492,310 +559,230 @@ const sifmTheme = (() => {
 })();
 </script>
 <style>
-/* ===========================================================================
-   SiFM — "Bullion". A dark-first gold-on-graphite theme on Bootstrap 5.3.
-   Bootstrap components are re-skinned through --bs-* tokens only; bespoke
-   classes exist where Bootstrap has no primitive (header, crumbs, icon-btn,
-   login card, code editor). Light mode lifts everything via [data-bs-theme].
-   =========================================================================== */
+/* SiFM — "Bullion": a dark-first gold-on-graphite theme on Bootstrap 5.3.
+   Bootstrap is re-skinned through --bs-* tokens only; bespoke classes exist
+   only where Bootstrap has no primitive (header, icon-btn, login,
+   editor). Light mode lifts everything through [data-bs-theme]. */
 :root, [data-bs-theme="dark"] {
   color-scheme: dark;
-
   --bs-font-sans-serif: 'IBM Plex Sans', system-ui, -apple-system, 'Segoe UI', Roboto, Arial, sans-serif;
   --bs-font-monospace: 'IBM Plex Mono', ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
-  --bs-body-font-family: var(--bs-font-sans-serif);
-  --bs-body-line-height: 1.65;
+  --bs-body-font-family: var(--bs-font-sans-serif); --bs-body-line-height: 1.65;
 
   /* Surfaces — graphite */
-  --bs-body-bg: #101216;
-  --bs-body-bg-rgb: 16, 18, 22;
-  --bs-body-color: #d4d7dd;
-  --bs-body-color-rgb: 212, 215, 221;
-  --bs-heading-color: #f4f4f3;
-  --bs-emphasis-color: #f4f4f3;
-  --bs-emphasis-color-rgb: 244, 244, 243;
-  --bs-secondary-color: #8b909a;
-  --bs-secondary-bg: #171a1f;
-  --bs-tertiary-bg: #1c2026;
-  --bs-border-color: rgba(255, 255, 255, 0.11);
-  --bs-border-color-translucent: rgba(255, 255, 255, 0.07);
-  --surface: #171a20;
-  --surface-2: #1e222a;
+  --bs-body-bg: #101216; --bs-body-bg-rgb: 16, 18, 22;
+  --bs-body-color: #d4d7dd; --bs-body-color-rgb: 212, 215, 221;
+  --bs-heading-color: #f4f4f3; --bs-emphasis-color: #f4f4f3; --bs-emphasis-color-rgb: 244, 244, 243;
+  --bs-secondary-color: #8b909a; --bs-secondary-rgb: 139, 144, 154; --bs-secondary-bg: #171a1f; --bs-tertiary-bg: #1c2026;
+  --bs-border-color: rgba(255, 255, 255, .11); --bs-border-color-translucent: rgba(255, 255, 255, .07);
+  --surface: #171a20; --surface-2: #1e222a;
 
   /* Brand — bullion gold */
-  --bs-primary: #f2b33d;
-  --bs-primary-rgb: 242, 179, 61;
-  --bs-primary-text-emphasis: #f7cd85;
-  --bs-primary-bg-subtle: rgba(242, 179, 61, 0.13);
-  --bs-primary-border-subtle: rgba(242, 179, 61, 0.32);
-  --on-primary: #1d1504;
-  --gold: #f2b33d;
-  --gold-hover: #e0a12c;
-  --gold-active: #cc901f;
+  --bs-primary: #f2b33d; --bs-primary-rgb: 242, 179, 61; --bs-primary-text-emphasis: #f7cd85;
+  --bs-primary-bg-subtle: rgba(242, 179, 61, .13); --bs-primary-border-subtle: rgba(242, 179, 61, .32);
+  --on-primary: #1d1504; --gold: #f2b33d; --gold-hover: #e0a12c; --gold-active: #cc901f;
 
   /* Second accent — ember, gradients only */
-  --ember: #ff8f3f;
-  --ember-rgb: 255, 143, 63;
+  --ember: #ff8f3f; --ember-rgb: 255, 143, 63;
 
-  /* Editor tokens with no theme-wide equivalent */
-  --tok-string: #9fd08a;
-  --tok-def: #ffcf80;
-  --tok-attr: #ffe3b0;
+  /* Code surface + syntax tokens — the atom-one highlight.js theme, value for
+     value, so the editor and the source view are one and the same theme. */
+  --code-bg: #282c34; --code-fg: #abb2bf; --code-gut: #21252b; --code-line: #23272f;
+  --code-sel: rgba(242, 179, 61, .22);
+  --tok-keyword: #c678dd; --tok-string: #98c379; --tok-number: #d19a66;
+  --tok-comment: #5c6370; --tok-title: #61aeee; --tok-attr: #e06c75;
+  --tok-builtin: #e6c07b; --tok-literal: #56b6c2;
 
-  --bs-warning: #f59e0b;
-  --bs-warning-rgb: 245, 158, 11;
-  --bs-success: #46c98b;
-  --bs-success-rgb: 70, 201, 139;
-  --bs-danger: #ff6b6b;
-  --bs-danger-rgb: 255, 107, 107;
-  --bs-info: #6aa8ff;
-  --bs-info-rgb: 106, 168, 255;
+  --bs-warning: #f59e0b; --bs-warning-rgb: 245, 158, 11;
+  --bs-success: #46c98b; --bs-success-rgb: 70, 201, 139;
+  --bs-danger: #ff6b6b; --bs-danger-rgb: 255, 107, 107;
+  --bs-info: #6aa8ff; --bs-info-rgb: 106, 168, 255;
 
-  --bs-link-color-rgb: var(--bs-primary-rgb);
-  --bs-link-hover-color-rgb: 247, 205, 133;
-  --bs-link-decoration: none;
+  --bs-link-color-rgb: var(--bs-primary-rgb); --bs-link-hover-color-rgb: 247, 205, 133;
 
-  --bs-border-radius: 0.7rem;
-  --bs-border-radius-sm: 0.45rem;
-  --bs-border-radius-lg: 1rem;
-  --bs-border-radius-xl: 1.3rem;
+  --bs-border-radius: .7rem; --bs-border-radius-sm: .45rem;
+  --bs-border-radius-lg: 1rem; --bs-border-radius-xl: 1.3rem;
 
-  --bs-box-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 22px -12px rgba(0, 0, 0, 0.7);
-  --bs-box-shadow: 0 2px 6px rgba(0, 0, 0, 0.45), 0 20px 45px -20px rgba(0, 0, 0, 0.8);
+  --bs-box-shadow-sm: 0 1px 2px rgba(0, 0, 0, .4), 0 8px 22px -12px rgba(0, 0, 0, .7);
+  --bs-box-shadow: 0 2px 6px rgba(0, 0, 0, .45), 0 20px 45px -20px rgba(0, 0, 0, .8);
 
-  --snap: 0.18s ease;
-  --focus: 0 0 0 0.22rem rgba(242, 179, 61, 0.3);
+  --snap: .18s ease; --focus: 0 0 0 .22rem rgba(242, 179, 61, .3);
 }
 
 [data-bs-theme="light"] {
   color-scheme: light;
 
-  --bs-body-bg: #f7f6f2;
-  --bs-body-bg-rgb: 247, 246, 242;
-  --bs-body-color: #2a2721;
-  --bs-body-color-rgb: 42, 39, 33;
-  --bs-heading-color: #17150f;
-  --bs-emphasis-color: #000;
-  --bs-emphasis-color-rgb: 0, 0, 0;
-  --bs-secondary-color: #6f6a5e;
-  --bs-secondary-bg: #eeece5;
-  --bs-tertiary-bg: #e7e4db;
-  --bs-border-color: rgba(23, 21, 15, 0.14);
-  --bs-border-color-translucent: rgba(23, 21, 15, 0.08);
-  --surface: #ffffff;
-  --surface-2: #f1efe8;
+  --bs-body-bg: #f7f6f2; --bs-body-bg-rgb: 247, 246, 242;
+  --bs-body-color: #2a2721; --bs-body-color-rgb: 42, 39, 33;
+  --bs-heading-color: #17150f; --bs-emphasis-color: #000; --bs-emphasis-color-rgb: 0, 0, 0;
+  --bs-secondary-color: #6f6a5e; --bs-secondary-rgb: 111, 106, 94; --bs-secondary-bg: #eeece5; --bs-tertiary-bg: #e7e4db;
+  --bs-border-color: rgba(23, 21, 15, .14); --bs-border-color-translucent: rgba(23, 21, 15, .08);
+  --surface: #fff; --surface-2: #f1efe8;
 
-  --bs-primary: #9a6f0c;
-  --bs-primary-rgb: 154, 111, 12;
-  --bs-primary-text-emphasis: #7c5a09;
-  --bs-primary-bg-subtle: #f6ebd2;
-  --bs-primary-border-subtle: #e6d0a2;
-  --on-primary: #ffffff;
-  --gold: #9a6f0c;
-  --gold-hover: #85600a;
-  --gold-active: #715108;
+  --bs-primary: #9a6f0c; --bs-primary-rgb: 154, 111, 12; --bs-primary-text-emphasis: #7c5a09;
+  --bs-primary-bg-subtle: #f6ebd2; --bs-primary-border-subtle: #e6d0a2;
+  --on-primary: #fff; --gold: #9a6f0c; --gold-hover: #85600a; --gold-active: #715108;
 
-  --ember: #d96a26;
-  --ember-rgb: 217, 106, 38;
+  --ember: #d96a26; --ember-rgb: 217, 106, 38;
 
-  /* Editor tokens — dark hexes wash out on white, so light gets its own */
-  --tok-string: #2e7d32;
-  --tok-def: #9a4d0c;
-  --tok-attr: #7a5c14;
+  /* Code surface + syntax tokens — atom-one-light, the sheet the source view
+     loads in light mode, value for value. */
+  --code-bg: #fafafa; --code-fg: #383a42; --code-gut: #f0f0f0; --code-line: #f2f2f2;
+  --code-sel: rgba(154, 111, 12, .18);
+  --tok-keyword: #a626a4; --tok-string: #50a14f; --tok-number: #986801;
+  --tok-comment: #a0a1a7; --tok-title: #4078f2; --tok-attr: #e45649;
+  --tok-builtin: #c18401; --tok-literal: #0184bb;
 
-  --bs-warning: #b45309;
-  --bs-warning-rgb: 180, 83, 9;
-  --bs-success: #14855a;
-  --bs-success-rgb: 20, 133, 90;
-  --bs-danger: #d43d3d;
-  --bs-danger-rgb: 212, 61, 61;
-  --bs-info: #2563d9;
-  --bs-info-rgb: 37, 99, 217;
+  --bs-warning: #b45309; --bs-warning-rgb: 180, 83, 9;
+  --bs-success: #14855a; --bs-success-rgb: 20, 133, 90;
+  --bs-danger: #d43d3d; --bs-danger-rgb: 212, 61, 61;
+  --bs-info: #2563d9; --bs-info-rgb: 37, 99, 217;
 
-  --bs-link-color-rgb: 154, 111, 12;
-  --bs-link-hover-color-rgb: 113, 81, 8;
+  --bs-link-color-rgb: 154, 111, 12; --bs-link-hover-color-rgb: 113, 81, 8;
 
-  --bs-box-shadow-sm: 0 1px 2px rgba(23, 21, 15, 0.06), 0 8px 20px -12px rgba(23, 21, 15, 0.18);
-  --bs-box-shadow: 0 2px 6px rgba(23, 21, 15, 0.08), 0 20px 42px -22px rgba(23, 21, 15, 0.28);
+  --bs-box-shadow-sm: 0 1px 2px rgba(23, 21, 15, .06), 0 8px 20px -12px rgba(23, 21, 15, .18);
+  --bs-box-shadow: 0 2px 6px rgba(23, 21, 15, .08), 0 20px 42px -22px rgba(23, 21, 15, .28);
 
-  --focus: 0 0 0 0.22rem rgba(154, 111, 12, 0.25);
+  --focus: 0 0 0 .22rem rgba(154, 111, 12, .25);
 }
 
 body {
-  min-height: 100vh;
-  background-color: var(--bs-body-bg);
-  background-image:
-    radial-gradient(1000px 520px at 85% -10%, rgba(var(--bs-primary-rgb), 0.09), transparent 60%),
-    radial-gradient(800px 460px at -5% -5%, rgba(var(--ember-rgb), 0.06), transparent 55%);
-  background-attachment: fixed;
-  -webkit-font-smoothing: antialiased;
+  min-height: 100vh; background-color: var(--bs-body-bg); background-attachment: fixed; -webkit-font-smoothing: antialiased;
+  background-image: radial-gradient(1000px 520px at 85% -10%, rgba(var(--bs-primary-rgb), .09), transparent 60%),
+                    radial-gradient(800px 460px at -5% -5%, rgba(var(--ember-rgb), .06), transparent 55%);
 }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; letter-spacing: -.015em; }
+code { font-family: var(--bs-font-monospace); color: var(--bs-primary); background: rgba(var(--bs-primary-rgb), .1); padding: .1em .4em; border-radius: var(--bs-border-radius-sm); }
+::selection { background: rgba(var(--bs-primary-rgb), .3); }
+a { text-decoration: none; }
+a:not(.btn):not(.icon-btn):hover { text-decoration: underline; text-underline-offset: .2em; }
 
-h1, h2, h3, h4, h5, h6 { font-weight: 600; letter-spacing: -0.015em; color: var(--bs-heading-color); }
-.mono { font-family: var(--bs-font-monospace); }
-code { font-family: var(--bs-font-monospace); color: var(--bs-primary); background: rgba(var(--bs-primary-rgb), 0.1); padding: 0.1em 0.4em; border-radius: var(--bs-border-radius-sm); }
-::selection { background: rgba(var(--bs-primary-rgb), 0.3); }
-a{text-decoration:none;}
-a:not(.btn):not(.icon-btn):not(.crumbs a):hover { text-decoration: underline; text-underline-offset: 0.2em; }
 /* ---- Buttons: pill shape, gold primary, a quiet ghost variant. ---- */
 .btn {
-  --bs-btn-border-radius: 999px;
-  --bs-btn-font-weight: 600;
-  display: inline-flex; align-items: center; justify-content: center; gap: 0.45em;
+  --bs-btn-border-radius: 999px; --bs-btn-font-weight: 600;
+  display: inline-flex; align-items: center; justify-content: center; gap: .45em;
   transition: transform var(--snap), box-shadow var(--snap), background-color var(--snap), border-color var(--snap), color var(--snap);
 }
 .btn:active { transform: translateY(1px); }
 .btn:focus-visible { box-shadow: var(--focus); }
 .btn-primary {
-  --bs-btn-color: var(--on-primary);
-  --bs-btn-bg: var(--bs-primary);
-  --bs-btn-border-color: var(--bs-primary);
-  --bs-btn-hover-color: var(--on-primary);
-  --bs-btn-hover-bg: var(--gold-hover);
-  --bs-btn-hover-border-color: var(--gold-hover);
-  --bs-btn-active-color: var(--on-primary);
-  --bs-btn-active-bg: var(--gold-active);
-  --bs-btn-active-border-color: var(--gold-active);
+  --bs-btn-color: var(--on-primary); --bs-btn-bg: var(--bs-primary); --bs-btn-border-color: var(--bs-primary);
+  --bs-btn-hover-color: var(--on-primary); --bs-btn-hover-bg: var(--gold-hover); --bs-btn-hover-border-color: var(--gold-hover);
+  --bs-btn-active-color: var(--on-primary); --bs-btn-active-bg: var(--gold-active); --bs-btn-active-border-color: var(--gold-active);
   --bs-btn-focus-shadow-rgb: var(--bs-primary-rgb);
 }
-.btn-primary:hover { box-shadow: 0 10px 26px -12px rgba(var(--bs-primary-rgb), 0.7); }
+.btn-primary:hover { box-shadow: 0 10px 26px -12px rgba(var(--bs-primary-rgb), .7); }
 .btn-ghost {
-  --bs-btn-color: var(--bs-body-color);
-  --bs-btn-bg: transparent;
-  --bs-btn-border-color: var(--bs-border-color);
-  --bs-btn-hover-color: var(--bs-primary);
-  --bs-btn-hover-bg: var(--surface-2);
-  --bs-btn-hover-border-color: rgba(var(--bs-primary-rgb), 0.55);
-  --bs-btn-active-color: var(--bs-primary);
-  --bs-btn-active-bg: var(--surface-2);
-  --bs-btn-active-border-color: rgba(var(--bs-primary-rgb), 0.55);
+  --bs-btn-color: var(--bs-body-color); --bs-btn-bg: transparent; --bs-btn-border-color: var(--bs-border-color);
+  --bs-btn-hover-color: var(--bs-primary); --bs-btn-hover-bg: var(--surface-2); --bs-btn-hover-border-color: rgba(var(--bs-primary-rgb), .55);
+  --bs-btn-active-color: var(--bs-primary); --bs-btn-active-bg: var(--surface-2); --bs-btn-active-border-color: rgba(var(--bs-primary-rgb), .55);
   --bs-btn-focus-shadow-rgb: var(--bs-primary-rgb);
 }
 .form-control, .form-select { border-radius: 999px; }
 textarea.form-control { border-radius: var(--bs-border-radius); }
 .form-check-input:focus { border-color: var(--bs-primary); box-shadow: var(--focus); }
 .form-check-input:checked { background-color: var(--bs-primary); border-color: var(--bs-primary); }
+
 /* ---- Header: sticky, blurred, brand + icon cluster. ---- */
 html { --site-head-h: 3.4rem; }
+/* .sticky-top + .z-3 give the position, the offset and the stacking order —
+   only the blur, the height and the hairline are bespoke. */
 .site-header {
-  position: sticky; top: 0; z-index: 1030;
   height: var(--site-head-h);
-  background: rgba(var(--bs-body-bg-rgb), 0.82);
-  backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+  background: rgba(var(--bs-body-bg-rgb), .82); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
   border-bottom: 1px solid var(--bs-border-color);
 }
-.header-inner { display: flex; align-items: center; gap: 1rem; padding: 0.55rem 1rem; max-width: 1400px; margin: 0 auto; }
-.brand { display: inline-flex; align-items: center; gap: 0.6rem; flex: 0 0 auto; }
 .brand-mark {
   width: 2.3rem; height: 2.3rem; display: inline-flex; align-items: center; justify-content: center;
-  border-radius: 0.75rem; font-family: var(--bs-font-monospace); font-weight: 700; color: var(--on-primary);
+  border-radius: .75rem; font-family: var(--bs-font-monospace); font-weight: 700; color: var(--on-primary);
   background-image: linear-gradient(135deg, var(--bs-primary), var(--ember));
-  box-shadow: 0 8px 22px -10px rgba(var(--bs-primary-rgb), 0.8);
+  box-shadow: 0 8px 22px -10px rgba(var(--bs-primary-rgb), .8);
 }
-.brand-name { font-weight: 700; letter-spacing: -0.01em; color: var(--bs-heading-color); line-height: 1; }
+.brand-name { font-weight: 700; letter-spacing: -.01em; color: var(--bs-heading-color); line-height: 1; }
 .brand:hover .brand-name { color: var(--bs-primary); text-decoration: none; }
-.brand-tagline { font-family: var(--bs-font-monospace); font-size: 0.64rem; letter-spacing: 0.1em; color: var(--bs-secondary-color); }
-.header-tools { display: flex; align-items: center; gap: 0.4rem; flex: 0 0 auto; margin-left: auto; }
 
-/* ---- Icon buttons: a ring around a bare glyph. The ring belongs to the base
-   class, so every context shares it; each context only sizes its own circles. ---- */
+/* ---- Icon buttons: one ring around a bare glyph; each context only sizes it.
+   The dark ring is stronger because the 0.11 ring vanishes on deep graphite. ---- */
 .icon-btn {
-  display: inline-flex; align-items: center; justify-content: center;
-  padding: 0; background: none; /* the base must survive a <button>: no UA chrome */
-  border: 1px solid var(--bs-border-color); border-radius: 999px;
-  color: var(--bs-secondary-color);
+  display: inline-flex; align-items: center; justify-content: center; padding: 0; background: none;
+  border: 1px solid var(--bs-border-color); border-radius: 999px; color: var(--bs-secondary-color);
   transition: color var(--snap), background-color var(--snap), border-color var(--snap);
 }
-.icon-btn:hover {
-  color: var(--bs-primary); background: rgba(var(--bs-primary-rgb), 0.12);
-  border-color: rgba(var(--bs-primary-rgb), 0.45); text-decoration: none;
-}
-/* Dark mode: the 0.11 ring vanishes on the deep background — icon-only
-   controls need their outline to read at a glance. */
-[data-bs-theme="dark"] .icon-btn { border-color: rgba(255, 255, 255, 0.3); }
-/* Header circles are one step bigger than the rows'; the actions column sits
-   between the two so the row glyphs breathe without shouting. */
+.icon-btn:hover { color: var(--bs-primary); background: rgba(var(--bs-primary-rgb), .12); border-color: rgba(var(--bs-primary-rgb), .45); text-decoration: none; }
+[data-bs-theme="dark"] .icon-btn { border-color: rgba(255, 255, 255, .3); }
 .header-tools .icon-btn { width: 2.5rem; height: 2.5rem; font-size: 1.3rem; }
-.cell-actions .icon-btn { width: 1.85rem; height: 1.85rem; font-size: 0.95rem; }
-/* Cells run on white-space: pre, so the buttons sit flush — the ring needs
-   its own gap (header gets theirs from .header-tools' flex gap). */
-.cell-actions .icon-btn + .icon-btn { margin-left: 0.5rem; }
+.cell-actions .icon-btn { width: 1.85rem; height: 1.85rem; font-size: .95rem; }
+/* Cells run on white-space: pre, so the buttons sit flush — the ring needs its own gap. */
+.cell-actions .icon-btn + .icon-btn { margin-left: .5rem; }
 
-/* ---- Breadcrumb: top of <main>, right under the sticky header. ---- */
-.crumbs {
-  display: flex; align-items: center; gap: 0.35rem; min-width: 0; overflow-x: auto;
-  white-space: nowrap; font-family: var(--bs-font-monospace); font-size: 0.85rem;
-  scrollbar-width: none; margin-bottom: 0.9rem;
-}
-.crumbs::-webkit-scrollbar { display: none; }
-.crumbs a { color: var(--bs-secondary-color); }
-.crumbs a:hover { color: var(--bs-primary); }
-.crumbs .sep { color: var(--bs-secondary-color); opacity: 0.6; }
-.crumbs .leaf { color: var(--bs-primary); font-weight: 600; }
-.toolbar { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: center; justify-content: space-between; margin-bottom: 1rem; }
+/* ---- Search: the box is the only thing that needs a width of its own. ---- */
 .search-form .input-group { width: min(21rem, 70vw); }
-.search-form .form-control { border-top-right-radius: 0; border-bottom-right-radius: 0; }
-.search-form .btn { border-top-left-radius: 0; border-bottom-left-radius: 0; }
 
-/* ---- Table on a tile: cells stay transparent over the rounded card. ---- */
-.tile { background: var(--surface); border: 1px solid var(--bs-border-color); border-radius: var(--bs-border-radius-lg); box-shadow: var(--bs-box-shadow-sm); }
-.table { --bs-table-bg: transparent; --bs-table-color: var(--bs-body-color); --bs-table-border-color: var(--bs-border-color); --bs-table-striped-bg: rgba(var(--bs-body-color-rgb), 0.03); --bs-table-hover-bg: rgba(var(--bs-primary-rgb), 0.06); }
-.table thead th { color: var(--bs-secondary-color); font-weight: 600; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.06em; }
-/* Every header and cell keeps its text verbatim — no wrapping, no collapsing.
-   Names, sizes and timestamps stay byte-for-byte as they are on disk; the
-   card already scrolls sideways (.table-responsive), so nothing is lost. */
+/* ---- Table on a card: cells stay transparent over the rounded surface. ---- */
+.table { --bs-table-bg: transparent; --bs-table-color: var(--bs-body-color); --bs-table-border-color: var(--bs-border-color); --bs-table-striped-bg: rgba(var(--bs-body-color-rgb), .03); --bs-table-hover-bg: rgba(var(--bs-primary-rgb), .06); }
+.table thead th { color: var(--bs-secondary-color); font-weight: 600; font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; }
+/* Names, sizes and timestamps stay byte-for-byte as they are on disk; the
+   card already scrolls sideways, so nothing is lost. */
 table th, table td { white-space: pre; }
-.table > tbody > td { vertical-align: middle; }
 .col-check { width: 1%; }
-.cell-name a { color: var(--bs-body-color); font-weight: 500; }
-.cell-name a:hover { color: var(--bs-primary); }
+/* The name keeps the body colour (Bootstrap's .text-body) and turns gold on
+   hover — the hover needs !important to beat that utility's own !important. */
+.cell-name a:hover { color: var(--bs-primary) !important; }
 .cell-name i { width: 1.6rem; color: var(--bs-secondary-color); text-align: center; }
-.cell-name .fa-folder-open { color: var(--bs-primary) !important; }
 .perms { color: var(--bs-secondary-color); }
 .perms:hover { color: var(--bs-primary); }
-.empty-cell { text-align: center; padding: 3rem 1rem; color: var(--bs-secondary-color); }
-.empty-cell i { font-size: 2rem; opacity: 0.5; }
 
 /* ---- Cards / panels / flashes ---- */
+/* Bootstrap declares --bs-card-box-shadow but never reads it in 5.3.3 (vestigial,
+   like --bs-link-decoration), so the shadow and radius are set directly. */
 .card { --bs-card-bg: var(--surface); --bs-card-border-color: var(--bs-border-color); --bs-card-cap-bg: transparent; box-shadow: var(--bs-box-shadow-sm); border-radius: var(--bs-border-radius-lg); }
-.panel-head { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: center; justify-content: space-between; margin-bottom: 0.9rem; position: sticky; top: var(--site-head-h); z-index: 1020; background: var(--bs-body-bg); }
-.alert { border-radius: var(--bs-border-radius); border-width: 1px; font-weight: 500; }
-.kv { display: grid; grid-template-columns: max-content 1fr; gap: 0.35rem 1.2rem; }
-.kv dt { color: var(--bs-secondary-color); font-weight: 500; font-size: 0.88rem; }
+.panel-head { display: flex; flex-wrap: wrap; gap: .6rem; align-items: center; justify-content: space-between; margin-bottom: .9rem; position: sticky; top: var(--site-head-h); z-index: 1020; background: var(--bs-body-bg); }
+.kv { display: grid; grid-template-columns: max-content 1fr; gap: .35rem 1.2rem; }
 .kv dd { margin: 0; overflow-wrap: anywhere; }
 
 /* ---- Sign-in card ---- */
-.login-wrap { min-height: calc(100vh - 8rem); display: grid; place-items: center; padding: 1.5rem; }
-.login-card { width: 100%; max-width: 24rem; }
 .login-card .brand-mark { width: 3rem; height: 3rem; font-size: 1.2rem; margin-inline: auto; }
 
-/* ---- Code pages: source view (highlight.js) and the editor (in-file tokenizer) ---- */
-pre.src { border-radius: var(--bs-border-radius); border: 1px solid var(--bs-border-color); background: var(--surface); padding: 1rem; overflow-x: auto; font-size: 0.86rem; line-height: 1.6; font-family: 'JetBrains Mono', var(--bs-font-monospace); }
+/* ---- Code pages: source view (highlight.js) and editor (CodeMirror 6) ----
+   CodeMirror fills .ed and paints its own scrollbars; only the shell is here.
+   The editor and its textarea fallback share one viewport-driven height. ---- */
+pre.src, pre.out, .ed { border: 1px solid var(--bs-border-color); border-radius: var(--bs-border-radius); background: var(--code-bg); }
+pre.src, pre.out { padding: 1rem; font-size: .86rem; }
+pre.src { overflow-x: auto; line-height: 1.6; font-family: 'JetBrains Mono', var(--bs-font-monospace); }
 pre.src code { background: none; color: inherit; font-family: inherit; padding: 0; }
-/* highlight.js line-numbers plugin */
-pre.src .hljs-ln { border-collapse: collapse; }
-pre.src .hljs-ln-numbers { user-select: none; text-align: right; color: var(--bs-secondary-color); opacity: 0.7; border-right: 1px solid var(--bs-border-color); padding-right: 0.75rem; vertical-align: top; white-space: nowrap; }
-pre.src .hljs-ln-code { padding-left: 0.75rem; white-space: pre; }
+pre.src .hljs-ln { border-collapse: collapse; } /* highlight.js line-numbers plugin */
+pre.src .hljs-ln-numbers { user-select: none; text-align: right; color: var(--bs-secondary-color); opacity: .7; border-right: 1px solid var(--bs-border-color); padding-right: .75rem; vertical-align: top; white-space: nowrap; }
+pre.src .hljs-ln-code { padding-left: .75rem; white-space: pre; }
 pre.src .hljs-ln-line { height: 1.6em; }
-pre.out { border-radius: var(--bs-border-radius); border: 1px solid var(--bs-border-color); background: var(--surface); padding: 1rem; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.86rem; }
-/* Editor: a CodeMirror 6 instance fills the box; the textarea below it is the
-   no-JS / no-network fallback and the form's actual field. Both share one
-   viewport-driven height: it tracks the window, clamped so tiny and huge
-   screens stay sane. */
+pre.out { white-space: pre-wrap; overflow-wrap: anywhere; }
 .cm-editor, #editor { height: clamp(16rem, calc(100vh - 10.5rem), 68rem); height: clamp(16rem, calc(100dvh - 10.5rem), 68rem); }
 .drop-zone { border: 2px dashed var(--bs-border-color); border-radius: var(--bs-border-radius); padding: 1.2rem; text-align: center; transition: border-color .15s, background-color .15s; }
 .drop-zone.drag-over { border-color: var(--bs-primary); background-color: rgba(var(--bs-primary-rgb), .08); }
 .drop-zone .form-control { max-width: 26rem; margin-inline: auto; }
-.ed { border: 1px solid var(--bs-border-color); border-radius: var(--bs-border-radius); overflow: hidden; }
-/* CodeMirror fills .ed and paints its own scrollbars; the gutter border and
-   theme colours arrive from the JS theme, so only the shell is styled here. */
+.ed { overflow: hidden; }
 .ed .cm-editor { height: 100%; }
-.ed .cm-scroller { overflow: auto; font-family: var(--bs-font-monospace); font-size: 0.9rem; line-height: 1.6; }
+.ed .cm-scroller { overflow: auto; font-family: var(--bs-font-monospace); font-size: .9rem; line-height: 1.6; }
 .ed .cm-gutters { border-right: 1px solid var(--bs-border-color); }
 
-.site-footer { color: var(--bs-secondary-color); font-size: 0.82rem; }
+/* ---- Markdown preview: the rendered document, in the app's own tokens. ---- */
+.md { line-height: 1.7; }
+.md > :first-child { margin-top: 0; }
+.md h1, .md h2, .md h3, .md h4 { font-weight: 600; letter-spacing: -.015em; margin: 1.4rem 0 .6rem; }
+.md h1 { font-size: 1.7rem; } .md h2 { font-size: 1.4rem; } .md h3 { font-size: 1.15rem; } .md h4 { font-size: 1rem; }
+.md p { margin-bottom: .9rem; }
+.md ul, .md ol { margin-bottom: .9rem; padding-left: 1.5rem; }
+.md li { margin-bottom: .25rem; }
+.md hr { border-color: var(--bs-border-color); opacity: 1; }
+.md blockquote { border-left: 3px solid var(--bs-border-color); padding: .2rem 0 .2rem 1rem; color: var(--bs-secondary-color); }
+.md pre { background: var(--code-bg); border: 1px solid var(--bs-border-color); border-radius: var(--bs-border-radius); padding: 1rem; overflow-x: auto; }
+.md pre code { background: none; color: inherit; padding: 0; }
+.md table { width: 100%; margin-bottom: 1rem; border-collapse: collapse; }
+.md th, .md td { border: 1px solid var(--bs-border-color); padding: .5rem .75rem; text-align: left; }
+.md th { background: var(--surface-2); }
+.md img { max-width: 100%; border-radius: var(--bs-border-radius); }
+
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after { transition-duration: 0.001ms !important; animation-duration: 0.001ms !important; }
+  *, *::before, *::after { transition-duration: .001ms !important; animation-duration: .001ms !important; }
 }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js" defer></script>
@@ -803,18 +790,15 @@ pre.out { border-radius: var(--bs-border-radius); border: 1px solid var(--bs-bor
 <body class="py-0">
 
 <?php if ($action !== 'signin'): ?>
-<header class="site-header">
-  <div class="header-inner">
-    <a class="brand" href="<?= url('folder') ?>">
+<header class="site-header sticky-top z-3">
+  <div class="d-flex align-items-center gap-3 px-3 py-2 mx-auto" style="max-width:1400px">
+    <a class="brand d-inline-flex align-items-center gap-2 flex-shrink-0" href="<?= url('folder') ?>">
       <span class="brand-mark">S</span>
       <span>
         <span class="brand-name"><?= SIFM_NAME ?></span>
       </span>
     </a>
-    <div class="header-tools">
-      <?php if (keeps()): ?>
-      <a class="icon-btn" href="<?= url('trash') ?>" title="Trash"><?= icon('trash') ?></a>
-      <?php endif; ?>
+    <div class="header-tools d-flex align-items-center gap-2 flex-shrink-0 ms-auto">
       <button type="button" class="icon-btn" id="theme-toggle" title="Switch to light theme" onclick="sifmTheme.flip()">
         <?= icon('moon') ?>
       </button>
@@ -827,14 +811,41 @@ pre.out { border-radius: var(--bs-border-radius); border: 1px solid var(--bs-bor
 <?php endif; ?>
 
 <main class="container-fluid px-3 px-md-4 py-4" style="max-width:1400px">
-<?php if ($action !== 'signin'): ?>
-<?= breadcrumb($crumbs['path'], $crumbs['leaf']) ?>
+<?php if ($action !== 'signin'):
+    /* Breadcrumb: home, then every folder segment as a link, the file as the
+       active item. Bootstrap's own markup — the "/" divider and the two
+       colours come from the framework, so no CSS of our own is needed. At the
+       root there is nothing to show: a lone home icon tells nobody anything. */
+    $segments = [];
+    $deep = '';
+    foreach (explode('/', path($file !== '' ? $file_folder : $folder)) as $seg) {
+        if ($seg === '') {
+            continue;
+        }
+        $deep = $deep === '' ? $seg : $deep . '/' . $seg;
+        $segments[] = [$deep, $seg];
+    }
+    $leaf = $file !== '' ? basename($file) : '';
+?>
+<?php if ($segments || $leaf !== ''): ?>
+<nav aria-label="Breadcrumb">
+  <ol class="breadcrumb">
+    <li class="breadcrumb-item"><a href="<?= url('folder') ?>" aria-label="Home folder" title="Home folder"><?= icon('house') ?></a></li>
+<?php foreach ($segments as [$seg_path, $seg]): ?>
+    <li class="breadcrumb-item"><a href="<?= url('folder', $seg_path) ?>"><?= e($seg) ?></a></li>
+<?php endforeach; ?>
+<?php if ($leaf !== ''): ?>
+    <li class="breadcrumb-item active" aria-current="page"><?= e($leaf) ?></li>
+<?php endif; ?>
+  </ol>
+</nav>
+<?php endif; ?>
 <?php endif; ?>
 <?= message() ?>
 <?php switch ($action): ?>
 <?php case 'signin': ?>
-<div class="login-wrap">
-  <div class="card login-card">
+<div class="d-flex align-items-center justify-content-center p-4" style="min-height:calc(100vh - 8rem)">
+  <div class="card login-card w-100" style="max-width:24rem">
     <div class="card-body p-4 p-md-5">
       <div class="text-center mb-4">
         <span class="brand-mark mb-3">S</span>
@@ -859,34 +870,76 @@ pre.out { border-radius: var(--bs-border-radius); border: 1px solid var(--bs-bor
 
 <?php case 'folder': ?>
 <?php
+    /* The listing preferences (sort, order, hidden files, extension filter)
+       live in the session — the sort bar posts them and every link on the
+       page keeps them without a query string. */
+    $prefs = array_merge(['sort' => 'name', 'dir' => 'asc', 'hidden' => '1', 'ext' => ''], $_SESSION['listing'] ?? []);
     $children = $fm->list($folder);
+    $exts = [];
+    foreach ($children as $child) {
+        $ext = strtolower(pathinfo($child, PATHINFO_EXTENSION));
+        if ($ext !== '') {
+            $exts[$ext] = true;
+        }
+    }
+    if ($prefs['hidden'] !== '1') {
+        $children = array_values(array_filter($children, fn($c) => !str_starts_with($c, '.')));
+    }
+    if ($prefs['ext'] !== '') {
+        $want = strtolower($prefs['ext']);
+        $children = array_values(array_filter($children, fn($c) => strtolower(pathinfo($c, PATHINFO_EXTENSION)) === $want));
+    }
     $dirs = [];
     $files = [];
+    $meta = [];
     foreach ($children as $child) {
-        $rel = ($folder !== '' ? $folder . '/' : '') . $child;
+        $rel = rel($folder, $child);
+        $meta[$child] = $fm->info($rel);
         if ($fm->isfolder($rel)) {
             $dirs[] = $child;
         } else {
             $files[] = $child;
         }
     }
-    sort($dirs, SORT_NATURAL | SORT_FLAG_CASE);
-    sort($files, SORT_NATURAL | SORT_FLAG_CASE);
+    $cmp = match ($prefs['sort']) {
+        'size' => fn($a, $b) => ($meta[$a]['size'] ?? 0) <=> ($meta[$b]['size'] ?? 0),
+        'date' => fn($a, $b) => ($meta[$a]['last_modified'] ?? '') <=> ($meta[$b]['last_modified'] ?? ''),
+        'type' => fn($a, $b) => [strtolower(pathinfo($a, PATHINFO_EXTENSION)), strtolower($a)]
+                            <=> [strtolower(pathinfo($b, PATHINFO_EXTENSION)), strtolower($b)],
+        default => fn($a, $b) => strnatcasecmp($a, $b),
+    };
+    usort($dirs, $cmp);
+    usort($files, $cmp);
+    if ($prefs['dir'] === 'desc') {
+        $dirs = array_reverse($dirs);
+        $files = array_reverse($files);
+    }
 ?>
-<div class="toolbar">
-  <div class="d-flex flex-wrap gap-2">
-    <a class="btn btn-ghost btn-sm" href="<?= url('create', $folder) ?>"><?= icon('circle-plus') ?> Create</a>
-    <a class="btn btn-ghost btn-sm" href="<?= url('upload', $folder) ?>"><?= icon('upload') ?> Upload</a>
-    <a class="btn btn-ghost btn-sm" href="<?= url('import', $folder) ?>"><?= icon('cloud-arrow-down') ?> Import</a>
-    <a class="btn btn-ghost btn-sm" href="<?= url('backup', $folder) ?>"><?= icon('suitcase') ?> Backup</a>
-    <?php if ($folder !== ''): ?>
-    <a class="btn btn-ghost btn-sm" href="<?= url('copy', $folder) ?>"><?= icon('copy') ?> Copy</a>
-    <a class="btn btn-ghost btn-sm" href="<?= url('move', $folder) ?>"><?= icon('exchange') ?> Move</a>
-    <a class="btn btn-ghost btn-sm" href="<?= url('rename', $folder) ?>"><?= icon('pencil') ?> Rename</a>
-    <a class="btn btn-ghost btn-sm text-danger" href="<?= url('delete', $folder) ?>"><?= icon('trash') ?> Delete</a>
-    <?php endif; ?>
+<div class="d-flex flex-wrap gap-2 align-items-center justify-content-between mb-3">
+  <form method="post" action="<?= url('folder', $folder) ?>" class="d-flex flex-wrap justify-content-right gap-2">
+  <?= csrf_field() ?>
+  <span class="text-secondary small"><b>Sort</b></span>
+  <select class="form-select form-select-sm w-auto" name="sort" aria-label="Sort by">
+    <option value="name"<?= $prefs['sort'] === 'name' ? ' selected' : '' ?>>Name</option>
+    <option value="size"<?= $prefs['sort'] === 'size' ? ' selected' : '' ?>>Size</option>
+    <option value="date"<?= $prefs['sort'] === 'date' ? ' selected' : '' ?>>Modified</option>
+    <option value="type"<?= $prefs['sort'] === 'type' ? ' selected' : '' ?>>Type</option>
+  </select>
+  <select class="form-select form-select-sm w-auto" name="dir" aria-label="Order">
+    <option value="asc"<?= $prefs['dir'] === 'asc' ? ' selected' : '' ?>>Ascending</option>
+    <option value="desc"<?= $prefs['dir'] === 'desc' ? ' selected' : '' ?>>Descending</option>
+  </select>
+  <input type="text" class="form-control form-control-sm" name="ext" list="exts" value="<?= e($prefs['ext']) ?>" placeholder="Filter .ext" aria-label="Filter by extension" style="max-width:9rem">
+  <datalist id="exts"><?php foreach (array_keys($exts) as $one): ?><option value="<?= e($one) ?>"><?php endforeach; ?></datalist>
+  <input type="hidden" name="hidden" value="0">
+  <div class="form-check form-switch m-0">
+    <input class="form-check-input" type="checkbox" role="switch" id="show-hidden" name="hidden" value="1"<?= $prefs['hidden'] === '1' ? ' checked' : '' ?>>
+    <label class="form-check-label small" for="show-hidden">Hidden</label>
   </div>
-  <form class="search-form" method="post" action="<?= url('search', $folder) ?>">
+  <button class="btn btn-primary btn-sm" type="submit">Apply</button>
+  <button class="btn btn-ghost btn-sm" type="submit" name="reset" value="1">Reset</button>
+</form>
+   <form class="search-form" method="post" action="<?= url('search', $folder) ?>">
     <?= csrf_field(); ?>
     <div class="input-group">
       <input type="search" class="form-control" name="q" placeholder="Search — * and ? wildcards" value="<?= e(post('q')) ?>" aria-label="Search">
@@ -894,11 +947,10 @@ pre.out { border-radius: var(--bs-border-radius); border: 1px solid var(--bs-bor
     </div>
   </form>
 </div>
-
 <form method="post" action="<?= url('folder', $folder) ?>">
   <?= csrf_field() ?>
-  <div class="table-responsive tile">
-    <table class="table align-middle mb-0">
+  <div class="table-responsive card">
+    <table class="table align-middle table-sm table-striped table-bordered mb-0">
       <thead>
         <tr>
           <th class="col-check"><input type="checkbox" class="form-check-input" onclick="toggleAll(this)" aria-label="Select all"></th>
@@ -907,26 +959,30 @@ pre.out { border-radius: var(--bs-border-radius); border: 1px solid var(--bs-bor
       </thead>
       <tbody>
 <?php if (!$dirs && !$files): ?>
-        <tr><td colspan="6" class="empty-cell"><?= icon('folder-open') ?><div class="mt-2">Empty folder</div></td></tr>
+        <tr><td colspan="6" class="text-center py-5 px-3 text-secondary"><span class="fs-2 opacity-50"><?= icon('folder-open', 'primary') ?></span><div class="mt-2">Empty folder</div></td></tr>
 <?php endif; ?>
 <?php foreach ([...$dirs, ...$files] as $child): ?>
-        <?= row(($folder !== '' ? $folder . '/' : '') . $child, true) ?>
+        <?= row(rel($folder, $child), true, false, $meta[$child]) ?>
 <?php endforeach; ?>
       </tbody>
     </table>
   </div>
-  <div class="d-flex flex-wrap gap-2 align-items-center mt-3">
-    <label class="text-secondary small mb-0" for="multi-action">With selected:</label>
+  <div class="d-flex flex-wrap gap-2 align-items-center justify-content-between mt-3">
+    <div class="d-flex flex-wrap gap-2 mt-2">
+    <label class="text-secondary small mb-0" for="multi-action"><b>With selected:</b></label>
     <select class="form-select form-select-sm w-auto" name="action" id="multi-action">
-      <option value="backup">Backup</option>
-      <option value="copy">Copy</option>
-      <option value="move">Move</option>
-      <option value="chmod">Chmod</option>
-      <option value="download">Download</option>
-      <option value="delete">Delete</option>
+      <?php foreach ($kinds as $k => $label): ?>
+      <option value="<?= e($k) ?>"><?= e($label) ?></option>
+      <?php endforeach; ?>
     </select>
     <input type="hidden" name="multi" value="1">
     <button class="btn btn-primary btn-sm" type="submit" name="submit" value="1">Go</button>
+      </div>
+     <div class="d-flex flex-wrap gap-2 mt-2">
+    <?php foreach ($tools as [$label, $glyph, $link, $key, $cls]): ?>
+    <a class="btn btn-ghost btn-sm <?= $cls ?>" href="<?= $link ?>"><?= icon($glyph) ?> <?= e($label) ?></a>
+    <?php endforeach; ?>
+  </div>
   </div>
 </form>
 <?php break; ?>
@@ -935,28 +991,34 @@ pre.out { border-radius: var(--bs-border-radius); border: 1px solid var(--bs-bor
 <?php
     $q = trim(post('q'));
     $scope = path($folder);
-    $hits = $q !== '' ? $fm->search($q, $scope) : [];
+    /* Two kinds of search: by name (with wildcards) and by content. */
+    $mode = post('mode') === 'content' ? 'content' : 'names';
+    $hits = $q !== '' ? ($mode === 'content' ? $fm->grep($q, $scope) : $fm->search($q, $scope)) : [];
 ?>
 <div class="panel-head">
   <form class="search-form d-flex" method="post" action="<?= url('search', $folder) ?>">
     <?= csrf_field() ?>
     <div class="input-group">
-      <input type="search" class="form-control" name="q" placeholder="Search — * and ? wildcards" value="<?= e($q) ?>" aria-label="Search" autofocus>
+      <select class="form-select" name="mode" aria-label="What to search">
+        <option value="names"<?= $mode === 'names' ? ' selected' : '' ?>>Names</option>
+        <option value="content"<?= $mode === 'content' ? ' selected' : '' ?>>Content</option>
+      </select>
+      <input type="search" class="form-control" name="q" placeholder="<?= $mode === 'content' ? 'Search inside the files' : 'Search — * and ? wildcards' ?>" value="<?= e($q) ?>" aria-label="Search" autofocus>
       <button class="btn btn-primary" type="submit"><?= icon('magnifying-glass') ?> Search</button>
     </div>
   </form>
-  <span class="text-secondary small mono">Searching in folder: /<?= e($scope) ?><?= $q !== '' ? ' · ' . count($hits) . ' result(s)' : '' ?></span>
+  <span class="text-secondary small font-monospace"><?= $mode === 'content' ? 'Inside the files of' : 'Searching in folder:' ?> /<?= e($scope) ?><?= $q !== '' ? ' · ' . count($hits) . ' result(s)' : '' ?></span>
 </div>
-<div class="table-responsive tile">
+<div class="table-responsive card">
   <table class="table align-middle mb-0">
     <thead>
       <tr><th>Name</th><th>Size</th><th>Perms</th><th>Modified</th><th>Actions</th></tr>
     </thead>
     <tbody>
 <?php if ($q === ''): ?>
-      <tr><td colspan="5" class="empty-cell"><?= icon('magnifying-glass') ?><div class="mt-2">Type a keyword — or use wildcards like <code>*.log</code> or <code>report*</code></div></td></tr>
+      <tr><td colspan="5" class="text-center py-5 px-3 text-secondary"><span class="fs-2 opacity-50"><?= icon('magnifying-glass') ?></span><div class="mt-2"><?= $mode === 'content' ? 'Type a keyword — the content of every file under the folder is searched' : 'Type a keyword — or use wildcards like <code>*.log</code> or <code>report*</code>' ?></div></td></tr>
 <?php elseif (!$hits): ?>
-      <tr><td colspan="5" class="empty-cell"><?= icon('magnifying-glass') ?><div class="mt-2">Nothing matched &ldquo;<?= e($q) ?>&rdquo;</div></td></tr>
+      <tr><td colspan="5" class="text-center py-5 px-3 text-secondary"><span class="fs-2 opacity-50"><?= icon('magnifying-glass') ?></span><div class="mt-2">Nothing matched &ldquo;<?= e($q) ?>&rdquo;</div></td></tr>
 <?php else: ?>
       <?php foreach ($hits as $hit): ?>
       <?= row($hit, false, true) ?>
@@ -971,24 +1033,35 @@ pre.out { border-radius: var(--bs-border-radius); border: 1px solid var(--bs-bor
 <?php
     $info = (object) $fm->info($file);
     $ext = strtolower((string) ($info->extension ?? ''));
-    $editable = in_array($ext, $fm::edit, true);
+    $editable = in_array($ext, fm::edit, true);
+    /* What the browser can show on its own. The file lives inside the
+       document root, so its plain URL is all the preview needs. */
+    $preview = match ($ext) {
+        'jpg', 'jpeg', 'png', 'gif', 'webp', 'avif', 'bmp', 'svg' => 'image',
+        'pdf' => 'pdf',
+        'mp3', 'wav', 'ogg', 'm4a', 'flac', 'aac' => 'audio',
+        'mp4', 'webm', 'ogv', 'mov' => 'video',
+        'md' => 'markdown',
+        default => '',
+    };
+    $src = '//' . SIFM_HOST . '/' . implode('/', array_map('rawurlencode', explode('/', $file)));
 ?>
 <div class="panel-head">
   <h1 class="h5 mb-0">File details</h1>
 </div>
 <div class="card"><div class="card-body">
   <dl class="kv mb-0">
-    <dt>Path</dt><dd class="mono"><?= e($info->path) ?></dd>
-    <dt>Size</dt><dd><?= e($info->size ?? '—') ?></dd>
-    <dt>MIME-Type</dt><dd class="mono"><?= e($info->mimetype ?? '—') ?></dd>
-    <dt>Permissions</dt><dd><a class="perms mono" href="<?= url('chmod', $file) ?>"><?= e($info->perms) ?></a></dd>
-    <dt>Owner</dt><dd class="mono"><?= e($info->owner) ?></dd>
-    <dt>Last modified</dt><dd><?= e($info->last_modified) ?> <span class="text-secondary">(<?= e(timeago($info->last_modified)) ?>)</span></dd>
+    <dt class="text-secondary fw-medium small">Path</dt><dd class="font-monospace"><?= e($info->path) ?></dd>
+    <dt class="text-secondary fw-medium small">Size</dt><dd><?= e($info->size ?? '—') ?></dd>
+    <dt class="text-secondary fw-medium small">MIME-Type</dt><dd class="font-monospace"><?= e($info->mimetype ?? '—') ?></dd>
+    <dt class="text-secondary fw-medium small">Permissions</dt><dd><a class="perms font-monospace" href="<?= url('chmod', $file) ?>"><?= e($info->perms) ?></a></dd>
+    <dt class="text-secondary fw-medium small">Owner</dt><dd class="font-monospace"><?= e($info->owner) ?></dd>
+    <dt class="text-secondary fw-medium small">Last modified</dt><dd><?= e($info->last_modified) ?> <span class="text-secondary">(<?= e(timeago($info->last_modified)) ?>)</span></dd>
   </dl>
 </div></div>
 <div class="d-flex flex-wrap gap-2 mt-3">
   <a class="btn btn-primary btn-sm" href="<?= url('download', $file) ?>"><?= icon('download') ?> Download</a>
-  <a class="btn btn-ghost btn-sm" href="//<?= SIFM_HOST ?>/<?= e($file) ?>"><?= icon('globe') ?> Open</a>
+  <a class="btn btn-ghost btn-sm" href="<?= e($src) ?>"><?= icon('globe') ?> Open</a>
 <?php if ($editable): ?>
   <a class="btn btn-ghost btn-sm" href="<?= url('edit', $file) ?>"><?= icon('pen') ?> Edit</a>
   <a class="btn btn-ghost btn-sm" href="<?= url('source', $file) ?>"><?= icon('code') ?> Source</a>
@@ -999,11 +1072,38 @@ pre.out { border-radius: var(--bs-border-radius); border: 1px solid var(--bs-bor
 <?php if ($ext === 'zip'): ?>
   <a class="btn btn-ghost btn-sm" href="<?= url('extract', $file) ?>"><?= icon('box') ?> Extract</a>
 <?php endif; ?>
+<?php if ($preview === 'image'): ?>
+  <a class="btn btn-ghost btn-sm" href="<?= url('image', $file) ?>"><?= icon('wand-magic-sparkles') ?> Image tools</a>
+<?php endif; ?>
   <a class="btn btn-ghost btn-sm" href="<?= url('copy', $file) ?>"><?= icon('copy') ?> Copy</a>
   <a class="btn btn-ghost btn-sm" href="<?= url('move', $file) ?>"><?= icon('exchange') ?> Move</a>
   <a class="btn btn-ghost btn-sm" href="<?= url('rename', $file) ?>"><?= icon('pencil') ?> Rename</a>
   <a class="btn btn-ghost btn-sm text-danger" href="<?= url('delete', $file) ?>"><?= icon('trash') ?> Delete</a>
 </div>
+<?php if ($preview !== ''): ?>
+<div class="card mt-3"><div class="card-body">
+<?php if ($preview === 'image'): ?>
+  <img class="img-fluid rounded" src="<?= e($src) ?>" alt="<?= e(basename($file)) ?>">
+<?php elseif ($preview === 'pdf'): ?>
+  <iframe class="w-100 rounded" style="height:70vh" src="<?= e($src) ?>" title="<?= e(basename($file)) ?>"></iframe>
+<?php elseif ($preview === 'audio'): ?>
+  <audio class="w-100" controls src="<?= e($src) ?>"></audio>
+<?php elseif ($preview === 'markdown'): ?>
+  <div id="md" class="md"><p class="text-secondary">Rendering…</p></div>
+  <script src="https://cdn.jsdelivr.net/npm/marked@18.1.1/lib/marked.umd.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.4.17/dist/purify.min.js"></script>
+  <script>
+  /* Markdown in, sanitised HTML out — DOMPurify is what keeps a hostile
+     document from running inside the app's own origin. */
+  fetch(<?= json_encode($src) ?>).then(function (r) { return r.text(); }).then(function (text) {
+    document.getElementById('md').innerHTML = DOMPurify.sanitize(marked.parse(text));
+  });
+  </script>
+<?php else: ?>
+  <video class="w-100 rounded" controls src="<?= e($src) ?>"></video>
+<?php endif; ?>
+</div></div>
+<?php endif; ?>
 <?php break; ?>
 
 <?php case 'edit': ?>
@@ -1013,52 +1113,74 @@ pre.out { border-radius: var(--bs-border-radius); border: 1px solid var(--bs-bor
     $content = $fm->source($file);
     $ext = strtolower(pathinfo($file, PATHINFO_EXTENSION));
     $mtime = (int) (@filemtime(SIFM_HOME . '/' . $file));
+    /* ?replace=1 still opens the panel (deep link), but the button toggles it
+       in place — the editor never navigates away. */
+    $replace = get('replace') === '1';
 ?>
 <form method="post" action="<?= url('edit', $file) ?>">
   <?= csrf_field() ?>
   <input type="hidden" name="mtime" value="<?= $mtime ?>">
   <div class="panel-head">
-    <span class="mono small text-secondary text-truncate" style="max-width:50%">/<?= e($file) ?> · <?= e($fm->size($file, $size)) ?></span>
+    <span class="font-monospace small text-secondary text-truncate" style="max-width:50%">/<?= e($file) ?> · <a href="<?= url('file', $file) ?>" class="btn btn-sm btn-ghost" tile="Co back to file information">Back</a></span>
     <div class="d-flex flex-wrap gap-2 ms-auto">
-<?php if (get('replace') !== '1'): ?>
-      <button class="btn btn-primary btn-sm" name="save" value="1"><?= icon('floppy-disk') ?> Save</button>
-<?php endif; ?>
-      <a class="btn btn-ghost btn-sm" href="<?= url('source', $file) ?>"><?= icon('code') ?> Source</a>
-<?php if ($ext === 'php'): ?>
-      <a class="btn btn-ghost btn-sm" href="<?= url('syntax', $file) ?>"><?= icon('bug') ?> Syntax</a>
-<?php endif; ?>
-      <a class="btn btn-ghost btn-sm" href="<?= url('edit', $file) . '&replace=1' ?>"><?= icon('arrows-rotate') ?> Replace&hellip;</a>
+      <button class="btn btn-primary btn-sm<?= $replace ? ' d-none' : '' ?>" name="save" value="1" id="save-btn"><?= icon('floppy-disk') ?> Save</button>
+      <button type="button" class="btn btn-ghost btn-sm" id="toggle-replace" aria-controls="replace-panel" aria-expanded="<?= $replace ? 'true' : 'false' ?>"><?= icon('arrows-rotate') ?> Replace&hellip;</button>
     </div>
   </div>
-<?php if (get('replace') === '1'): ?>
-  <div class="card"><div class="card-body">
-    <h2 class="h6">Replace a phrase</h2>
-    <div class="mb-3">
-      <label class="form-label" for="rep-from">Find</label>
-      <textarea class="form-control" id="rep-from" name="from" rows="3" required></textarea>
+  <div class="card mb-3<?= $replace ? '' : ' d-none' ?>" id="replace-panel">
+    <div class="card-body">
+      <h2 class="h6">Replace a phrase</h2>
+      <div class="mb-3">
+        <label class="form-label" for="rep-from">Find</label>
+        <textarea class="form-control" id="rep-from" name="from" rows="3" required></textarea>
+      </div>
+      <div class="mb-3">
+        <label class="form-label" for="rep-to">Replace with</label>
+        <textarea class="form-control" id="rep-to" name="to" rows="3"></textarea>
+      </div>
+      <div class="d-flex gap-2">
+        <button class="btn btn-primary" name="replace" value="1">Replace</button>
+        <button type="button" class="btn btn-ghost" id="replace-cancel">Cancel</button>
+      </div>
     </div>
-    <div class="mb-3">
-      <label class="form-label" for="rep-to">Replace with</label>
-      <textarea class="form-control" id="rep-to" name="to" rows="3"></textarea>
-    </div>
-    <div class="d-flex gap-2">
-      <button class="btn btn-primary" name="replace" value="1">Replace</button>
-      <a class="btn btn-ghost" href="<?= url('edit', $file) ?>">Cancel</a>
-    </div>
-  </div></div>
-<?php else: ?>
+  </div>
   <div id="ed" class="ed"></div>
   <textarea id="editor" name="data" class="form-control mt-2" rows="24" spellcheck="false" hidden><?= e($content) ?></textarea>
-<?php endif; ?>
 </form>
+<script>
+/* Replace works in place: the panel opens under the toolbar, the editor stays
+   where it is and the page never navigates. */
+(function () {
+  var panel = document.getElementById('replace-panel');
+  var open = document.getElementById('toggle-replace');
+  var cancel = document.getElementById('replace-cancel');
+  var save = document.getElementById('save-btn');
+  var from = document.getElementById('rep-from');
+  if (!panel || !open) {
+    return;
+  }
+  function show(on) {
+    panel.classList.toggle('d-none', !on);
+    open.setAttribute('aria-expanded', on ? 'true' : 'false');
+    if (save) {
+      save.classList.toggle('d-none', on);
+    }
+    if (on) {
+      from.focus();
+    }
+  }
+  open.addEventListener('click', function () { show(panel.classList.contains('d-none')); });
+  cancel.addEventListener('click', function () { show(false); });
+})();
+</script>
 <?php break; ?>
 
 <?php case 'source': ?>
 <?php $ext = strtolower(pathinfo($file, PATHINFO_EXTENSION)); ?>
 <div class="panel-head">
-  <span class="mono small text-secondary">/<?= e($file) ?></span>
+  <span class="font-monospace small text-secondary">/<?= e($file) ?> &mdash; <?= count(file($fm->abs($file))) ?> lines  [<?= $fm->size($file) ?>]</span>
   <div class="d-flex gap-2 ms-auto">
-<?php if (in_array($ext, $fm->edit, true)): ?>
+<?php if (in_array($ext, fm::edit, true)): ?>
     <a class="btn btn-ghost btn-sm" href="<?= url('edit', $file) ?>"><?= icon('pen') ?> Edit</a>
 <?php endif; ?>
     <a class="btn btn-ghost btn-sm" href="<?= url('file', $file) ?>">Back</a>
@@ -1073,14 +1195,14 @@ pre.out { border-radius: var(--bs-border-radius); border: 1px solid var(--bs-bor
     $bad = $out === '' || str_contains(strtolower($out), 'error');
 ?>
 <div class="panel-head">
-  <span class="mono small text-secondary">php -l /<?= e($file) ?></span>
+  <span class="font-monospace small text-secondary">php -l /<?= e($file) ?></span>
   <a class="btn btn-ghost btn-sm ms-auto" href="<?= url('file', $file) ?>">Back</a>
 </div>
 <?php if ($bad): ?>
-<div class="alert alert-danger mb-3" role="alert"><?= icon('triangle-exclamation') ?> Check errors in your code:</div>
-<pre class="out mono"><?= e($out !== '' ? $out : 'php -l produced no output — is shell_exec() enabled?') ?></pre>
+<div class="alert alert-danger fw-medium mb-3" role="alert"><?= icon('triangle-exclamation') ?> Check errors in your code:</div>
+<pre class="out font-monospace"><?= e($out !== '' ? $out : 'php -l produced no output — is shell_exec() enabled?') ?></pre>
 <?php else: ?>
-<div class="alert alert-success" role="alert"><?= icon('circle-check') ?> No syntax errors detected.</div>
+<div class="alert alert-success fw-medium" role="alert"><?= icon('circle-check') ?> No syntax errors detected.</div>
 <?php endif; ?>
 <?php break; ?>
 
@@ -1091,7 +1213,7 @@ pre.out { border-radius: var(--bs-border-radius); border: 1px solid var(--bs-bor
     <?= csrf_field() ?>
     <div class="mb-3">
       <label class="form-label" for="bk-name">Backup filename</label>
-      <input type="text" class="form-control mono" id="bk-name" name="n" value="<?= e(($folder !== '' ? $folder . '/' : '') . 'Backup.zip') ?>">
+      <input type="text" class="form-control font-monospace" id="bk-name" name="n" value="<?= e(rel($folder, 'Backup.zip')) ?>">
     </div>
     <div class="d-flex gap-2">
       <button class="btn btn-primary" name="bk" value="1">Backup</button>
@@ -1111,13 +1233,13 @@ pre.out { border-radius: var(--bs-border-radius); border: 1px solid var(--bs-bor
   <form method="post" action="<?= url('chmod', $target) ?>">
     <?= csrf_field() ?>
     <div class="mb-3">
-      <label class="form-label" for="mod">Permissions: <span class="mono"><?= e($mod) ?> &rarr;</span></label>
-      <input type="text" class="form-control mono" id="mod" name="mod" value="<?= e($mod) ?>" pattern="[0-7]{3,4}" maxlength="4" required>
+      <label class="form-label" for="mod">Permissions: <span class="font-monospace"><?= e($mod) ?> &rarr;</span></label>
+      <input type="text" class="form-control font-monospace" id="mod" name="mod" value="<?= e($mod) ?>" pattern="[0-7]{3,4}" maxlength="4" required>
       <div class="form-text">3–4 octal digits, e.g. 644 or 755.</div>
     </div>
     <div class="d-flex gap-2">
       <button class="btn btn-primary" type="submit">CHMOD</button>
-      <a class="btn btn-ghost" href="<?= url($file !== '' ? 'file' : 'folder', $file !== '' ? $file : dirname($target)) ?>">Cancel</a>
+      <a class="btn btn-ghost" href="<?= back($file, $target) ?>">Cancel</a>
     </div>
   </form>
 </div></div>
@@ -1126,17 +1248,54 @@ pre.out { border-radius: var(--bs-border-radius); border: 1px solid var(--bs-bor
 <?php case 'copy': case 'move': ?>
 <?php $is_copy = $action === 'copy'; ?>
 <div class="card"><div class="card-body">
-  <h1 class="h6 mb-3"><?= $is_copy ? 'Copy' : 'Move' ?> &ldquo;<span class="mono">/<?= e($target) ?></span>&rdquo; to:</h1>
+  <h1 class="h6 mb-3"><?= $is_copy ? 'Copy' : 'Move' ?> &ldquo;<span class="font-monospace">/<?= e($target) ?></span>&rdquo; to:</h1>
   <form method="post" action="<?= url($action, $target) ?>">
     <?= csrf_field() ?>
     <div class="mb-3">
       <label class="form-label" for="dest">Destination path</label>
-      <input type="text" class="form-control mono" id="dest" name="new" value="/<?= e($target) ?>" required>
+      <input type="text" class="form-control font-monospace" id="dest" name="new" value="/<?= e($target) ?>" required>
       <div class="form-text">Relative to the home folder. Missing parent folders are created.</div>
     </div>
     <div class="d-flex gap-2">
       <button class="btn btn-primary" name="<?= $is_copy ? 'copy' : 'move' ?>" value="1"><?= $is_copy ? 'Copy' : 'Move' ?></button>
-      <a class="btn btn-ghost" href="<?= url($file !== '' ? 'file' : 'folder', $target) ?>">Cancel</a>
+      <a class="btn btn-ghost" href="<?= back($file, $target) ?>">Cancel</a>
+    </div>
+  </form>
+  <form method="post" action="<?= url('clip', $target) ?>" class="mt-2">
+    <?= csrf_field() ?>
+    <input type="hidden" name="mode" value="<?= $is_copy ? 'copy' : 'cut' ?>">
+    <input type="hidden" name="items[]" value="<?= e(basename($target)) ?>">
+    <button class="btn btn-ghost" name="clip" value="1"><?= icon('clipboard') ?> <?= $is_copy ? 'Copy to clipboard' : 'Cut to clipboard' ?></button>
+  </form>
+</div></div>
+<?php break; ?>
+
+<?php case 'duplicate': ?>
+<?php
+    /* The name we suggest: "notes (copy).txt", then "(copy 2)", "(copy 3)"…
+       while the file is already taken. */
+    $stem = pathinfo($target, PATHINFO_FILENAME);
+    $ext = pathinfo($target, PATHINFO_EXTENSION);
+    $suffix = $ext !== '' ? '.' . $ext : '';
+    $suggest = $stem . ' (copy)' . $suffix;
+    $n = 2;
+    while ($fm->exists(rel(dirname($target), $suggest))) {
+        $suggest = $stem . ' (copy ' . $n . ')' . $suffix;
+        $n++;
+    }
+?>
+<div class="card"><div class="card-body">
+  <h1 class="h6 mb-3">Duplicate &ldquo;<span class="font-monospace">/<?= e($target) ?></span>&rdquo; as:</h1>
+  <form method="post" action="<?= url('duplicate', $target) ?>">
+    <?= csrf_field() ?>
+    <div class="mb-3">
+      <label class="form-label" for="dup-name">New name</label>
+      <input type="text" class="form-control font-monospace" id="dup-name" name="new" value="<?= e($suggest) ?>" required autofocus>
+      <div class="form-text">Lands next to the original. A folder is copied with everything inside it.</div>
+    </div>
+    <div class="d-flex gap-2">
+      <button class="btn btn-primary" name="dup" value="1">Duplicate</button>
+      <a class="btn btn-ghost" href="<?= back($file, $target) ?>">Cancel</a>
     </div>
   </form>
 </div></div>
@@ -1168,74 +1327,24 @@ pre.out { border-radius: var(--bs-border-radius); border: 1px solid var(--bs-bor
 
 <?php case 'delete': ?>
 <div class="card"><div class="card-body">
-  <h1 class="h6 text-danger"><?= icon('triangle-exclamation') ?> Delete <?= is_dir(SIFM_HOME . '/' . $target) ? 'folder' : 'file' ?> &ldquo;<span class="mono">/<?= e($target) ?></span>&rdquo;?</h1>
-  <p class="text-secondary mb-3"><?= keeps()
-      ? 'It moves to the trash — you can restore it from the <a href="' . url('trash') . '">trash page</a> until you empty the trash.'
-      : 'This is irreversible — deleted items cannot be recovered.' ?></p>
+  <h1 class="h6 text-danger"><?= icon('triangle-exclamation') ?> Delete <?= is_dir(SIFM_HOME . '/' . $target) ? 'folder' : 'file' ?> &ldquo;<span class="font-monospace">/<?= e($target) ?></span>&rdquo;?</h1>
+  <p class="text-secondary mb-3">This is irreversible — deleted items cannot be recovered.</p>
   <form method="post" action="<?= url('delete', $target) ?>" class="d-inline">
     <?= csrf_field() ?>
     <button class="btn btn-danger" name="del" value="1"><?= icon('trash') ?> Yes, delete</button>
-    <a class="btn btn-ghost" href="<?= url($file !== '' ? 'file' : 'folder', $file !== '' ? $file : dirname($target)) ?>">No, back</a>
+    <a class="btn btn-ghost" href="<?= back($file, $target) ?>">No, back</a>
   </form>
-</div></div>
-<?php break; ?>
-
-<?php case 'trash': ?>
-<?php $entries = $fm->trashed(); krsort($entries); ?>
-<div class="card"><div class="card-body">
-  <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3">
-    <h1 class="h6 mb-0"><?= icon('trash') ?> Trash <span class="text-secondary fw-normal">(<?= count($entries) ?> item<?= count($entries) === 1 ? '' : 's' ?>)</span></h1>
-    <?php if ($entries): ?>
-    <form method="post" action="<?= url('trash') ?>">
-      <?= csrf_field() ?>
-      <button class="btn btn-danger btn-sm" name="purge" value="1" onclick="return confirm('Destroy everything in the trash for good? This cannot be undone.')"><?= icon('fire') ?> Empty trash</button>
-    </form>
-    <?php endif; ?>
-  </div>
-
-  <?php if (!$entries): ?>
-  <p class="text-secondary mb-0">The trash is empty.</p>
-  <?php else: ?>
-  <div class="table-responsive">
-    <table class="table align-middle table-sm mb-0">
-      <thead><tr><th>Name</th><th>Was at</th><th>Deleted</th><th class="text-end">Actions</th></tr></thead>
-      <tbody>
-<?php foreach ($entries as $id => $one): ?>
-        <tr>
-          <td class="cell-name"><?= icon($one['dir'] ? 'folder' : 'file') ?> <span class="mono"><?= e(preg_replace('/^[^-]+-[^-]+-/', '', (string) $id)) ?></span></td>
-          <td class="mono text-secondary">/<?= e((string) ($one['from'] ?? '')) ?></td>
-          <td class="text-secondary"><?= e(date(SIFM_DATE, (int) ($one['at'] ?? 0))) ?></td>
-          <td class="text-end">
-            <div class="d-inline-flex gap-1">
-              <form method="post" action="<?= url('trash') ?>">
-                <?= csrf_field() ?>
-                <input type="hidden" name="id" value="<?= e((string) $id) ?>">
-                <button class="btn btn-ghost btn-sm" name="restore" value="1"><?= icon('rotate-left') ?> Restore</button>
-              </form>
-              <form method="post" action="<?= url('trash') ?>">
-                <?= csrf_field() ?>
-                <input type="hidden" name="id" value="<?= e((string) $id) ?>">
-                <button class="btn btn-ghost btn-sm text-danger" name="purge" value="1" onclick="return confirm('Destroy this for good?')"><?= icon('xmark') ?> Destroy</button>
-              </form>
-            </div>
-          </td>
-        </tr>
-<?php endforeach; ?>
-      </tbody>
-    </table>
-  </div>
-  <?php endif; ?>
 </div></div>
 <?php break; ?>
 
 <?php case 'extract': ?>
 <div class="card"><div class="card-body">
-  <h1 class="h6 mb-3">Extract &ldquo;<span class="mono">/<?= e($file) ?></span>&rdquo; to:</h1>
+  <h1 class="h6 mb-3">Extract &ldquo;<span class="font-monospace">/<?= e($file) ?></span>&rdquo; to:</h1>
   <form method="post" action="<?= url('extract', $file) ?>">
     <?= csrf_field() ?>
     <div class="mb-3">
       <label class="form-label" for="ex-dest">Destination folder</label>
-      <input type="text" class="form-control mono" id="ex-dest" name="u" value="/<?= e(dirname($file)) ?>" required>
+      <input type="text" class="form-control font-monospace" id="ex-dest" name="u" value="/<?= e(dirname($file)) ?>" required>
     </div>
     <div class="d-flex gap-2">
       <button class="btn btn-primary" name="ex" value="1">Extract</button>
@@ -1297,7 +1406,7 @@ pre.out { border-radius: var(--bs-border-radius); border: 1px solid var(--bs-bor
 
 <?php case 'rename': ?>
 <div class="card"><div class="card-body">
-  <h1 class="h6 mb-3">Rename &ldquo;<span class="mono">/<?= e($target) ?></span>&rdquo; to:</h1>
+  <h1 class="h6 mb-3">Rename &ldquo;<span class="font-monospace">/<?= e($target) ?></span>&rdquo; to:</h1>
   <form method="post" action="<?= url('rename', $target) ?>">
     <?= csrf_field() ?>
     <div class="mb-3">
@@ -1306,7 +1415,7 @@ pre.out { border-radius: var(--bs-border-radius); border: 1px solid var(--bs-bor
     </div>
     <div class="d-flex gap-2">
       <button class="btn btn-primary" name="ren" value="1">Rename</button>
-      <a class="btn btn-ghost" href="<?= url($file !== '' ? 'file' : 'folder', $file !== '' ? $file : dirname($target)) ?>">Cancel</a>
+      <a class="btn btn-ghost" href="<?= back($file, $target) ?>">Cancel</a>
     </div>
   </form>
 </div></div>
@@ -1417,30 +1526,47 @@ pre.out { border-radius: var(--bs-border-radius); border: 1px solid var(--bs-bor
 <?php break; ?>
 
 <?php case 'multi': ?>
+<?php $clipping = in_array($kind, ['pick', 'cut'], true); ?>
 <div class="card"><div class="card-body">
-  <h1 class="h6 mb-3">You are about to <span class="text-primary"><?= e($kind) ?></span> <?= count($items) ?> item(s):</h1>
+  <h1 class="h6 mb-3">You are about to <span class="text-primary"><?= e($kinds[$kind]) ?></span> <?= count($items) ?> item(s):</h1>
   <ul class="list-unstyled mb-3">
     <?php foreach ($items as $item): ?>
-    <li class="mono small py-1 border-bottom border-secondary border-opacity-25">/<?= e(($folder !== '' ? $folder . '/' : '') . $item) ?></li>
+    <li class="font-monospace small py-1 border-bottom border-secondary border-opacity-25">/<?= e(rel($folder, $item)) ?></li>
     <?php endforeach; ?>
   </ul>
 <?php if ($kind === 'delete'): ?>
-  <p class="text-secondary"><?= keeps()
-      ? 'The selected items move to the trash — restore them from the <a href="' . url('trash') . '">trash page</a> until you empty it.'
-      : 'This is irreversible — the selected items cannot be recovered.' ?></p>
+  <p class="text-secondary">This is irreversible — the selected items cannot be recovered.</p>
 <?php endif; ?>
-  <form method="post" action="<?= url('multi', $folder) ?>">
+  <form method="post" action="<?= $clipping ? url('clip', $folder) : url('multi', $folder) ?>">
     <?= csrf_field() ?>
     <input type="hidden" name="action" value="<?= e($kind) ?>">
+    <?php if ($clipping): ?>
+    <input type="hidden" name="mode" value="<?= $kind === 'cut' ? 'cut' : 'copy' ?>">
+    <?php endif; ?>
     <?php foreach ($items as $item): ?>
     <input type="hidden" name="items[]" value="<?= e($item) ?>">
     <?php endforeach; ?>
-<?php if (!in_array($kind, ['delete', 'download'], true)): ?>
+<?php if ($kind === 'chmod'): ?>
     <div class="mb-3">
-      <label class="form-label" for="multi-dest"><?= $kind === 'chmod' ? 'Permissions (e.g. 755)' : ($kind === 'backup' ? 'Backup filename' : 'Destination path') ?></label>
-      <input type="text" class="form-control mono" id="multi-dest" name="dest" required
-             value="<?= e($kind === 'backup' ? ($folder !== '' ? $folder . '/' : '') . 'Backup.zip' : ($kind === 'chmod' ? '' : '/' . $folder)) ?>"
-             <?= $kind === 'chmod' ? 'pattern="[0-7]{3,4}" maxlength="4" placeholder="755"' : '' ?>>
+      <label class="form-label" for="multi-dest">Permissions (e.g. 755)</label>
+      <input type="text" class="form-control font-monospace" id="multi-dest" name="dest" required pattern="[0-7]{3,4}" maxlength="4" placeholder="755">
+    </div>
+<?php elseif ($kind === 'backup'): ?>
+    <div class="mb-3">
+      <label class="form-label" for="multi-dest">Backup filename</label>
+      <input type="text" class="form-control font-monospace" id="multi-dest" name="dest" required value="<?= e(rel($folder, 'Backup.zip')) ?>">
+    </div>
+<?php elseif ($kind === 'rename'): ?>
+    <div class="mb-3">
+      <label class="form-label" for="multi-dest">Rename pattern</label>
+      <input type="text" class="form-control font-monospace" id="multi-dest" name="dest" required value="{name}">
+      <div class="form-text">Tokens: <span class="font-monospace">{name} {ext} {n} {date}</span> — the first item becomes <span class="font-monospace"><?= e(rename_pattern('{name}', $items[0] ?? '', 1)) ?></span>, the second <span class="font-monospace"><?= e(rename_pattern('{name}', $items[1] ?? $items[0] ?? '', 2)) ?></span>.</div>
+    </div>
+<?php elseif ($kind === 'copy' || $kind === 'move'): ?>
+    <div class="mb-3">
+      <label class="form-label" for="multi-dest">Destination path</label>
+      <input type="text" class="form-control font-monospace" id="multi-dest" name="dest" required value="/<?= e($folder) ?>">
+      <div class="form-text">Relative to the home folder. Missing parent folders are created.</div>
     </div>
 <?php endif; ?>
     <div class="d-flex gap-2">
@@ -1449,8 +1575,64 @@ pre.out { border-radius: var(--bs-border-radius); border: 1px solid var(--bs-bor
       <?php elseif ($kind === 'download'): ?>
       <button class="btn btn-primary" name="submit" value="1"><?= icon('file-zipper') ?> Build &amp; download ZIP</button>
       <?php else: ?>
-      <button class="btn btn-primary" name="submit" value="1"><?= ucfirst(e($kind)) ?></button>
+      <button class="btn btn-primary" name="submit" value="1"><?= e($kinds[$kind]) ?></button>
       <?php endif; ?>
+      <a class="btn btn-ghost" href="<?= url('folder', $folder) ?>">Cancel</a>
+    </div>
+  </form>
+</div></div>
+<?php break; ?>
+
+<?php case 'image': ?>
+<?php
+    $dim = @getimagesize(SIFM_HOME . '/' . $file);
+    $w = $dim ? (int) $dim[0] : 0;
+    $h = $dim ? (int) $dim[1] : 0;
+?>
+<div class="card"><div class="card-body">
+  <h1 class="h6 mb-3">Image tools &mdash; <span class="font-monospace"><?= e(basename($file)) ?></span></h1>
+  <p class="text-secondary"><?= $w ?> &times; <?= $h ?> px &middot; <?= e((string) ($fm->info($file)['mimetype'] ?? '')) ?></p>
+  <div class="d-flex flex-wrap gap-2 mb-3">
+    <form method="post" action="<?= url('image', $file) ?>">
+      <?= csrf_field() ?>
+      <button class="btn btn-ghost" name="op" value="left"><?= icon('rotate-left') ?> Rotate left</button>
+    </form>
+    <form method="post" action="<?= url('image', $file) ?>">
+      <?= csrf_field() ?>
+      <button class="btn btn-ghost" name="op" value="right"><?= icon('rotate-right') ?> Rotate right</button>
+    </form>
+    <form method="post" action="<?= url('image', $file) ?>">
+      <?= csrf_field() ?>
+      <button class="btn btn-ghost" name="op" value="webp"><?= icon('file-image') ?> Save as WebP</button>
+    </form>
+  </div>
+  <form method="post" action="<?= url('image', $file) ?>">
+    <?= csrf_field() ?>
+    <div class="d-flex gap-2 align-items-end">
+      <div>
+        <label class="form-label" for="img-w">Resize to (px wide)</label>
+        <input type="number" class="form-control font-monospace" id="img-w" name="w" min="1" max="10000" value="<?= $w > 0 ? (int) ($w / 2) : 800 ?>" required>
+      </div>
+      <button class="btn btn-primary" name="op" value="resize"><?= icon('arrows-left-right') ?> Resize</button>
+    </div>
+  </form>
+</div></div>
+<?php break; ?>
+
+<?php case 'paste': ?>
+<?php $clip = $_SESSION['clip'] ?? null; ?>
+<div class="card"><div class="card-body">
+  <h1 class="h6 mb-3">Paste <?= count($clip['items']) ?> item(s) into &ldquo;/<?= e($folder) ?>&rdquo;?</h1>
+  <ul class="list-unstyled mb-3">
+    <?php foreach ($clip['items'] as $item): ?>
+    <li class="font-monospace small py-1 border-bottom border-secondary border-opacity-25">/<?= e(rel($clip['from'], $item)) ?></li>
+    <?php endforeach; ?>
+  </ul>
+  <p class="text-secondary"><?= $clip['mode'] === 'cut' ? 'These items move out of their old folder.' : 'The originals stay where they are.' ?></p>
+  <form method="post" action="<?= url('paste', $folder) ?>">
+    <?= csrf_field() ?>
+    <div class="d-flex gap-2">
+      <button class="btn btn-primary" name="paste" value="1"><?= icon('paste') ?> Paste here</button>
       <a class="btn btn-ghost" href="<?= url('folder', $folder) ?>">Cancel</a>
     </div>
   </form>
@@ -1466,21 +1648,120 @@ pre.out { border-radius: var(--bs-border-radius); border: 1px solid var(--bs-bor
 </main>
 
 <?php if ($action !== 'signin'): ?>
-<footer class="site-footer text-center py-3 mono"><?= SIFM_NAME ?> v<?= SIFM_VERSION ?></footer>
+<div class="modal fade" id="palette" tabindex="-1" aria-labelledby="palette-label">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-header py-2">
+        <h1 class="modal-title fs-6 mb-0" id="palette-label">Command palette</h1>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body pt-0">
+        <input type="text" class="form-control form-control-sm mb-2" id="palette-q" placeholder="Type a command…" aria-label="Type a command" autocomplete="off">
+        <div class="list-group list-group-flush" id="palette-list">
+<?php foreach ($palette as [$label, $glyph, $link, $key, $cls]): ?>
+          <a class="list-group-item list-group-item-action d-flex justify-content-between align-items-center" href="<?= $link ?>"<?= $key !== '' ? ' data-key="' . e($key) . '"' : '' ?>>
+            <span><?= icon($glyph) ?> <?= e($label) ?></span>
+<?php if ($key !== ''): ?>
+            <kbd><?= e($key) ?></kbd>
+<?php endif; ?>
+          </a>
+<?php endforeach; ?>
+        </div>
+        <p class="text-secondary small mb-0 mt-2 d-none" id="palette-none">No command matches.</p>
+      </div>
+    </div>
+  </div>
+</div>
+<?php endif; ?>
+
+<?php if ($action !== 'signin'): ?>
+<footer class="text-center py-3 font-monospace text-secondary small"><?= SIFM_NAME ?> v<?= SIFM_VERSION ?></footer>
 <?php endif; ?>
 
 <script>
 function toggleAll(box) {
   document.querySelectorAll('input[name="items[]"]').forEach(function (b) { b.checked = box.checked; });
 }
+
+/* Command palette + single-key shortcuts. The list is rendered by PHP — the
+   script only filters it and reads the keys off the items themselves, so the
+   palette, the toolbar and the shortcuts can never drift apart. */
+document.addEventListener('DOMContentLoaded', function () {
+  var modal = document.getElementById('palette');
+  var list = document.getElementById('palette-list');
+  if (!modal || !window.bootstrap) {
+    return;
+  }
+  var pal = new bootstrap.Modal(modal);
+  var query = document.getElementById('palette-q');
+  var none = document.getElementById('palette-none');
+  var items = Array.prototype.slice.call(list.querySelectorAll('a'));
+  var keys = {};
+  items.forEach(function (a) {
+    if (a.dataset.key) {
+      keys[a.dataset.key] = a.href;
+    }
+  });
+
+  query.addEventListener('input', function () {
+    var needle = query.value.toLowerCase();
+    var hits = 0;
+    items.forEach(function (a) {
+      var show = a.textContent.toLowerCase().indexOf(needle) !== -1;
+      a.classList.toggle('d-none', !show);
+      if (show) {
+        hits++;
+      }
+    });
+    none.classList.toggle('d-none', hits > 0);
+  });
+
+  document.addEventListener('keydown', function (ev) {
+    var tag = (ev.target.tagName || '').toLowerCase();
+    var typing = tag === 'input' || tag === 'textarea' || tag === 'select' || ev.target.isContentEditable;
+
+    if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === 'k') {
+      ev.preventDefault();
+      query.value = '';
+      pal.show();
+      query.focus();
+      return;
+    }
+    if (typing || ev.ctrlKey || ev.metaKey || ev.altKey) {
+      return;
+    }
+    var key = ev.key.toLowerCase();
+    if (key === '/') {
+      var box = document.querySelector('.search-form input');
+      if (box) {
+        ev.preventDefault();
+        box.focus();
+      }
+      return;
+    }
+    if (key === 'escape') {
+      document.querySelectorAll('input[name="items[]"]').forEach(function (b) { b.checked = false; });
+      return;
+    }
+    if (keys[key]) {
+      ev.preventDefault();
+      window.location = keys[key];
+    }
+  });
+});
 </script>
 <?php if ($action === 'edit' && get('replace') !== '1'): ?>
 <?php
-    /* The editor's palette, straight off the design tokens — one map per
-       colour mode, so the JS theme and the PHP CSS can never drift apart. */
+    /* The editor's chrome, straight off the design tokens. Every value is a
+       CSS custom property, so a theme flip repaints the editor by itself —
+       one map, no per-mode copy. The syntax colours live in the same tokens
+       (--tok-*), the ones the source view's atom-one sheet uses. */
     $ed = [
-        'dark' => ['bg' => 'var(--surface)', 'fg' => 'var(--bs-body-color)', 'gut' => 'var(--surface-2)', 'gut2' => '#242932', 'brd' => 'var(--bs-border-color)', 'mut' => 'var(--bs-secondary-color)', 'sel' => 'rgba(242,179,61,.22)', 'line' => 'var(--surface-2)', 'cur' => 'var(--bs-primary)', 'kw' => 'var(--bs-primary)', 'num' => 'var(--ember)', 'str' => 'var(--tok-string)', 'cm' => '#7d828b', 'tag' => 'var(--tok-def)', 'vd' => '#ff8a80', 'fn' => '#64b5f6'],
-        'light' => ['bg' => 'var(--surface)', 'fg' => 'var(--bs-body-color)', 'gut' => 'var(--surface-2)', 'gut2' => '#f6f3ec', 'brd' => 'var(--bs-border-color)', 'mut' => 'var(--bs-secondary-color)', 'sel' => 'rgba(154,111,12,.18)', 'line' => '#f7f6f2', 'cur' => 'var(--bs-primary)', 'kw' => 'var(--bs-primary)', 'num' => 'var(--ember)', 'str' => 'var(--tok-string)', 'cm' => '#6f6a5e', 'tag' => 'var(--tok-def)', 'vd' => '#c62828', 'fn' => '#1565c0'],
+        'bg' => 'var(--code-bg)', 'fg' => 'var(--code-fg)',
+        'gut' => 'var(--code-gut)', 'gut2' => 'var(--code-line)',
+        'brd' => 'var(--bs-border-color)', 'mut' => 'var(--tok-comment)',
+        'sel' => 'var(--code-sel)', 'line' => 'var(--code-line)',
+        'cur' => 'var(--bs-primary)',
     ];
 ?>
 <script type="module">
@@ -1488,12 +1769,11 @@ function toggleAll(box) {
    The textarea below stays the form's only real field: every edit is mirrored
    into it, and if the CDN or the browser lets us down it simply stays visible. */
 const ta = document.getElementById('editor');
-const pals = <?= json_encode($ed) ?>;
+const pal = <?= json_encode($ed) ?>;
 const fam = '<?= lang($ext) ?>';
-const dark = document.documentElement.dataset.bsTheme !== 'light';
 
-/* The palette, as CM6 theme and highlight style. Built per polarity from the
-   same tokens the rest of the page uses, so a theme flip is a compartment swap. */
+/* The chrome, as a CM6 theme. The colours are CSS tokens, so the theme flip
+   reaches the editor without touching the instance. */
 const theme = (p) => ({
   '&': { backgroundColor: p.bg, color: p.fg, height: '100%' },
   '.cm-content': { caretColor: p.cur },
@@ -1505,15 +1785,19 @@ const theme = (p) => ({
   '.cm-panels': { backgroundColor: p.gut, color: p.fg },
   '.cm-searchMatch': { backgroundColor: p.sel },
 });
-const style = (p, tags) => [
-  { tag: [tags.keyword, tags.moduleKeyword, tags.controlKeyword, tags.operatorKeyword], color: p.kw },
-  { tag: [tags.string, tags.special(tags.string), tags.regexp], color: p.str },
-  { tag: [tags.comment, tags.blockComment, tags.lineComment], color: p.cm, fontStyle: 'italic' },
-  { tag: [tags.number, tags.bool, tags.null, tags.atom], color: p.num },
-  { tag: [tags.tagName, tags.typeName, tags.className, tags.angleBracket], color: p.tag },
-  { tag: [tags.function(tags.variableName), tags.function(tags.propertyName)], color: p.fn },
-  { tag: [tags.definition(tags.variableName), tags.definition(tags.propertyName)], color: p.vd },
-  { tag: [tags.propertyName, tags.attributeName, tags.variableName], color: p.fg },
+/* The syntax colours mirror the atom-one highlight.js theme, bucket for
+   bucket: keyword purple, string green, number/variable orange, literal cyan,
+   title blue, name red, built-in yellow, comment grey italic. The same tokens
+   paint the source view, so both read as one theme. */
+const style = (tags) => [
+  { tag: [tags.keyword, tags.moduleKeyword, tags.controlKeyword, tags.operatorKeyword, tags.definitionKeyword], color: 'var(--tok-keyword)' },
+  { tag: [tags.string, tags.special(tags.string), tags.regexp, tags.attributeValue], color: 'var(--tok-string)' },
+  { tag: [tags.comment, tags.blockComment, tags.lineComment, tags.docComment], color: 'var(--tok-comment)', fontStyle: 'italic' },
+  { tag: [tags.number, tags.variableName, tags.propertyName, tags.attributeName, tags.typeName], color: 'var(--tok-number)' },
+  { tag: [tags.bool, tags.null, tags.literal, tags.atom], color: 'var(--tok-literal)' },
+  { tag: [tags.function(tags.variableName), tags.function(tags.propertyName), tags.definition(tags.variableName), tags.definition(tags.propertyName), tags.macroName, tags.meta], color: 'var(--tok-title)' },
+  { tag: [tags.tagName], color: 'var(--tok-attr)' },
+  { tag: [tags.standard(tags.variableName), tags.standard(tags.propertyName)], color: 'var(--tok-builtin)' },
 ];
 
 /* Save in place: POST through fetch, show the verdict, refresh the mtime
@@ -1564,7 +1848,7 @@ try {
     import('@codemirror/search'),
     import('@lezer/highlight'),
   ]);
-  const { EditorState, Compartment } = state;
+  const { EditorState } = state;
   const { EditorView, keymap, lineNumbers, drawSelection, highlightActiveLine, highlightActiveLineGutter } = view;
   const { syntaxHighlighting, HighlightStyle, StreamLanguage, LanguageSupport } = language;
   const { defaultKeymap, history, historyKeymap, indentWithTab } = commands;
@@ -1584,9 +1868,6 @@ try {
     grammar = new LanguageSupport(StreamLanguage.define((await legacy('clike')).cpp));
   }
 
-  const pal = new Compartment();
-  const paint = (p) => [EditorView.theme(theme(p)), syntaxHighlighting(HighlightStyle.define(style(p, tags)))];
-
   const editor = new EditorView({
     parent: document.getElementById('ed'),
     state: EditorState.create({
@@ -1595,7 +1876,7 @@ try {
         lineNumbers(), history(), drawSelection(), highlightActiveLine(), highlightActiveLineGutter(),
         EditorView.lineWrapping, EditorState.tabSize.of(4), EditorView.updateListener.of((u) => { if (u.docChanged) ta.value = u.state.doc.toString(); }),
         keymap.of([...defaultKeymap, ...historyKeymap, ...searchKeymap, indentWithTab]),
-        pal.of(paint(pals[dark ? 'dark' : 'light'])),
+        EditorView.theme(theme(pal)), syntaxHighlighting(HighlightStyle.define(style(tags))),
         grammar,
       ],
     }),
@@ -1604,9 +1885,6 @@ try {
 
   /* CM6 ships its own find & replace panel — Ctrl/Cmd+F opens it. */
   EditorView.domEventHandlers({ keydown: (ev) => ((ev.ctrlKey || ev.metaKey) && ev.key === 'f' ? openSearchPanel(editor) || true : false) });
-
-  /* sifmTheme.apply() hands this the new polarity so the open editor repaints at once. */
-  window.__retheme = (dark) => editor.dispatch({ effects: pal.reconfigure(paint(pals[dark ? 'dark' : 'light'])) });
 } catch (err) {
   document.getElementById('ed').remove();
   ta.hidden = false;
@@ -1646,6 +1924,32 @@ function path(string $path): string
     return implode('/', $parts);
 }
 
+/** Home-relative path of $name inside $folder — the root folder prefixes
+ *  nothing, so no call ever has to spell out the "empty folder" case. */
+function rel(string $folder, string $name): string
+{
+    return path($folder . '/' . $name);
+}
+
+/** Where an item's action form returns to: the file's own page for a file,
+ *  the folder listing it lives in for a folder. */
+function back(string $file, string $target): string
+{
+    return $file !== '' ? url('file', $file) : url('folder', dirname($target));
+}
+
+/** The new name of a multi-rename: {name} {ext} {n} {date}. */
+function rename_pattern(string $pattern, string $item, int $n): string
+{
+    $info = pathinfo($item);
+    return strtr($pattern, [
+        '{name}' => $info['filename'] ?? $item,
+        '{ext}' => $info['extension'] ?? '',
+        '{n}' => (string) $n,
+        '{date}' => date('Ymd'),
+    ]);
+}
+
 /** Escape for HTML output — every echoed name, path and value goes through this. */
 function e($value): string
 {
@@ -1663,14 +1967,6 @@ function post(string $key, string $default = ''): string
 {
     $v = $_POST[$key] ?? $default;
     return is_string($v) ? $v : $default;
-}
-
-/** Is soft delete on? The one place deletion decides between parking an item
- *  in the trash and unlinking it — every delete site reads this, so flipping
- *  SIFM_TRASH cannot leave one path still trashing behind the other's back. */
-function keeps(): bool
-{
-    return SIFM_TRASH;
 }
 
 /** Build ?action&f=path — the whole router. The item runs through path(),
@@ -1691,13 +1987,16 @@ function redirect(string $action, ?string $item = ''): void
     exit;
 }
 
-/** FA6 icon. String second arg = text-colour utility, int = pixel size. */
+/** FA6 icon. The name may be bare ("folder-open" → "fas fa-folder-open") or
+ *  carry its own family ("fab fa-php") — never write the <i> tag by hand.
+ *  String second arg = text-colour utility, int = pixel size. */
 function icon(string $name, $opt = 0): string
 {
+    $family = preg_match('/^fa[bsrlkdt]\s/', $name) ? '' : 'fas fa-';
     $extra = is_string($opt) && $opt !== ''
         ? ' text-' . e($opt)
         : (is_int($opt) && $opt > 0 ? ' style="font-size:' . $opt . 'px"' : '');
-    return '<i class="fas fa-' . e($name) . $extra . '" aria-hidden="true"></i>';
+    return '<i class="' . $family . e($name) . $extra . '" aria-hidden="true"></i>';
 }
 
 /** One-shot flash message. $kind: 1 success, 2 info, 0 error. */
@@ -1767,31 +2066,6 @@ function timeago($time): string
     return $diff . ' ' . $units[$i] . ($diff === 1 ? '' : 's') . ' ago';
 }
 
-/** Breadcrumb: home icon, then each segment as a folder link. $leaf is the
- *  current file name shown in bold. At the root ($path and $leaf both empty)
- *  it returns nothing — a lone home icon tells nobody anything. Replaces the
- *  two duplicated copies the old code kept (top nav + list header). */
-function breadcrumb(string $path, string $leaf = ''): string
-{
-    if ($path === '' && $leaf === '') {
-        return '';
-    }
-    $out = '<nav class="crumbs" aria-label="Breadcrumb">'
-        . '<a href="' . url('folder') . '" title="Home folder">' . icon('house') . '</a>';
-    $deep = '';
-    foreach (explode('/', $path) as $seg) {
-        if ($seg === '' || $seg === '.') {
-            continue;
-        }
-        $deep = $deep === '' ? $seg : $deep . '/' . $seg;
-        $out .= '<span class="sep">/</span><a href="' . url('folder', $deep) . '">' . e($seg) . '</a>';
-    }
-    if ($leaf !== '') {
-        $out .= '<span class="sep">/</span><strong class="leaf">' . e($leaf) . '</strong>';
-    }
-    return $out . '</nav>';
-}
-
 /** Syntax family for a file extension — one key drives the in-file tokenizer
  *  for both the editor and the source view ('plain' = no highlighting). */
 function lang(string $ext): string
@@ -1816,24 +2090,24 @@ function lang(string $ext): string
 /** One table row — shared by the folder listing and the search results.
  *  $select adds the checkbox cell; $full shows the whole relative path
  *  instead of the bare name (search results need the location). */
-function row(string $rel, bool $select, bool $full = false): string
+function row(string $rel, bool $select, bool $full = false, ?array $meta = null): string
 {
-    static $fa = null;
-    $fm = new fm();
-    $fa ??= json_decode($fm::icons, true) ?: [];
+    static $fm = null, $fa = null;
+    $fm ??= new fm();
+    $fa ??= json_decode(fm::icons, true) ?: [];
 
     $rel = path($rel);
     $is_dir = $fm->isfolder($rel);
-    $info = (object) $fm->info($rel);
+    $info = (object) ($meta ?? $fm->info($rel));
     $name = $full ? $rel : basename($rel);
     $ext = strtolower((string) ($info->extension ?? ''));
 
-    $glyph = $is_dir
-        ? 'fa-folder-open text-primary'
-        : ($fa[$ext] ?? $fa['empty'] ?? 'fas fa-file-lines');
+    /* The icon map already carries the full class ("fas fa-file-alt",
+       "fab fa-php"), so icon() takes it as it is. */
+    $glyph = $is_dir ? 'folder-open' : ($fa[$ext] ?? $fa['empty'] ?? 'file-lines');
     $link = $is_dir ? url('folder', $rel) : url('file', $rel);
 
-    $actions = ['copy' => 'copy', 'delete' => 'trash', 'download' => 'download', 'move' => 'exchange', 'rename' => 'pencil'];
+    $actions = ['copy' => 'copy', 'duplicate' => 'clone', 'delete' => 'trash', 'download' => 'download', 'move' => 'exchange', 'rename' => 'pencil'];
     $links = '';
     foreach ($actions as $act => $glyph_act) {
         if ($act === 'download' && $is_dir) {
@@ -1846,10 +2120,10 @@ function row(string $rel, bool $select, bool $full = false): string
         . ($select
             ? '<td class="col-check"><input class="form-check-input" type="checkbox" name="items[]" value="' . e(basename($rel)) . '" aria-label="Select ' . e($name) . '"></td>'
             : '')
-        . '<td class="cell-name"><i class="fas ' . e($glyph) . '" aria-hidden="true"></i>'
-        . '<a href="' . $link . '">' . e($name) . '</a></td>'
+        . '<td class="cell-name">' . icon($glyph, $is_dir ? 'primary' : 0)
+        . '<a class="text-body fw-medium" href="' . $link . '">' . e($name) . '</a></td>'
         . '<td>' . ($is_dir ? '<span class="text-secondary">Folder</span>' : e($info->size)) . '</td>'
-        . '<td><a class="perms mono" href="' . url('chmod', $rel) . '">' . e($info->perms) . '</a></td>'
+        . '<td><a class="perms font-monospace" href="' . url('chmod', $rel) . '">' . e($info->perms) . '</a></td>'
         . '<td class="text-secondary small">' . e($info->last_modified) . '</td>'
         . '<td class="cell-actions">' . $links . '</td>'
         . '</tr>';
@@ -1863,20 +2137,18 @@ class fm
     /** Extensions the built-in editor accepts. */
     const edit = ["", "bat", "c", "cert", "cgi", "cpp", "css", "dat", "htaccess", "htm", "html", "ini", "js", "key", "json", "lock", "log", "md", "php", "pl", "py", "sh", "sql", "tpl", "txt", "wml", "xhtml", "xml"];
 
+    /** How far a content search goes: how many hits, how big a file. */
+    const grep_files = 200;
+    const grep_bytes = 1048576;
+
     /** Extension → FA6 icon class (json, decoded once by row()). */
     const icons = '{"7z":"fas fa-file-archive","aac":"fas fa-music","accdb":"fas fa-database","ai":"fas fa-image","aif":"fas fa-music","apk":"fab fa-android","app":"fas fa-window","avi":"fas fa-video","bak":"fas fa-save","bat":"fas fa-terminal","bmp":"fas fa-image","box":"fas fa-archive","bz":"fas fa-file-archive","c":"fas fa-code","cfg":"fas fa-file-alt","class":"fas fa-code","cmd":"fas fa-terminal","com":"fas fa-window","cpp":"fas fa-code","css":"fab fa-css3","csv":"fas fa-file-csv","db":"fas fa-database","dbf":"fas fa-database","deb":"fas fa-archive","doc":"fas fa-file-word","docx":"fas fa-file-word","drw":"fas fa-image","email":"fas fa-envelope","empty":"fas fa-file-alt","eot":"fas fa-font-case","eps":"fas fa-image","erb":"fas fa-code","exe":"fab fa-windows","flac":"fas fa-music","flv":"fas fa-video","gam":"fas fa-gamepad","gif":"fas fa-image","gz":"fas fa-file-archive","htaccess":"fas fa-server","htm":"fab fa-html5","html":"fab fa-html5","ico":"fas fa-image","ini":"fas fa-cog","iso":"fas fa-compact-disc","jar":"fas fa-window","java":"fab fa-java","jpeg":"fas fa-image","jpg":"fas fa-image","js":"fab fa-js","json":"fas fa-file-alt","lock":"fas fa-lock","log":"fas fa-file-alt","mail":"fas fa-envelope","md":"fab fa-markdown","mdb":"fas fa-database","mid":"fas fa-music","midi":"fas fa-music","mkv":"fas fa-video","mov":"fas fa-video","mp3":"fas fa-music","mp4":"fas fa-video","mpa":"fas fa-music","mpg":"fas fa-video","msg":"fas fa-envelope","msi":"fas fa-window","nes":"fas fa-gamepad","odt":"fas fa-file-alt","ogg":"fas fa-music","ogv":"fas fa-video","otf":"fas fa-font-case","pdb":"fas fa-database","pdf":"fas fa-file-pdf","php":"fab fa-php","phtml":"fab fa-html5","pl":"fas fa-code","png":"fas fa-image","ppt":"fas fa-file-powerpoint","pptx":"fas fa-file-powerpoint","ps":"fas fa-image","psd":"fas fa-image","py":"fab fa-python","rar":"fas fa-file-archive","rb":"fas fa-code","rom":"fas fa-gamepad","rpm":"fas fa-archive","rtf":"fas fa-file-alt","sav":"fas fa-save","sh":"fas fa-terminal","sql":"fas fa-database","svg":"fas fa-image","swf":"fas fa-video","tar":"fas fa-file-archive","tga":"fas fa-image","tif":"fas fa-image","tiff":"fas fa-image","ttf":"fas fa-font-case","twig":"fab fa-php","txt":"fas fa-file-alt","vb":"fas fa-window","wav":"fas fa-music","webm":"fas fa-video","wma":"fas fa-music","wmv":"fas fa-video","woff":"fas fa-font-case","xhtml":"fas fa-code","xls":"fas fa-file-excel","xlsx":"fas fa-file-excel","xml":"fas fa-code","xz":"fas fa-file-archive","yaml":"fas fa-file-alt","zip":"fas fa-file-archive"}';
 
-    /** Help topics, rendered as collapses on the help page. */
-    const help = '{"search":{"title":"search files and folders","info":"Open the search box in the toolbar (or the search page) and type a keyword — SiFM matches it anywhere in the path, case-insensitively.<br>Wildcards work too: <code>*.log</code> matches every log file, <code>report*</code> matches everything starting with \"report\", and <code>?</code> stands for a single character. Results link straight to the file or folder."},"download":{"title":"download files","info":"Click the download icon in a listing, or the Download button on the file page.<br><b>Several at once:</b> tick the boxes in the listing, pick <i>Download</i> under \"With selected\", press <i>Go</i> — SiFM builds one ZIP of your selection and downloads it."}}';
-
-    private static function abs(string $path): string
+    /** Every path is joined to SIFM_HOME — the one place an absolute path
+     *  is ever built. */
+    public function abs(string $path): string
     {
-        if(is_dir(SIFM_HOME)){
-          $abs = SIFM_HOME . "/" . trim($path, "/");
-        } else {
-          $abs = $_SERVER['DOCUMENT_ROOT'] ."/". trim($path, "/");
-        }
-        return $abs;
+        return SIFM_HOME . '/' . trim($path, '/');
     }
 
     public function exists(string $path): bool
@@ -1952,6 +2224,13 @@ class fm
         return chmod($this->abs($target), intval($mod, 8));
     }
 
+    /** The folder that will hold a file — created when it is missing.
+     *  "." (the home root) is already there and stays untouched. */
+    private function ensure(string $dir): bool
+    {
+        return $this->isfolder($dir) || $this->create($dir, true);
+    }
+
     public function copy(string $from, string $to): bool
     {
         $from = path($from);
@@ -1973,8 +2252,7 @@ class fm
         if (!$this->isfile($from)) {
             return false;
         }
-        $dest_dir = dirname($to);
-        if ($dest_dir !== '.' && !$this->isfolder($dest_dir) && !$this->create($dest_dir, true)) {
+        if (!$this->ensure(dirname($to))) {
             return false;
         }
         return copy($this->abs($from), $this->abs($to));
@@ -1987,8 +2265,7 @@ class fm
         if ($from === '' || $to === '') {
             return false;
         }
-        $dest_dir = dirname($to);
-        if ($dest_dir !== '.' && !$this->isfolder($dest_dir) && !$this->create($dest_dir, true)) {
+        if (!$this->ensure(dirname($to))) {
             return false;
         }
         return rename($this->abs($from), $this->abs($to));
@@ -2005,98 +2282,7 @@ class fm
         return rename($this->abs($from), $this->abs($dest));
     }
 
-    /** Name of the hidden folder deletions are parked in, at the home root. */
-    const trash = '.sifm-trash';
-
-    /** Manifest inside the trash: entry id → the path it came from, so a
-     *  restore can put it back exactly where it was. */
-    private function manifest(): string
-    {
-        return $this->abs(self::trash . '/.manifest.json');
-    }
-
-    /** Park a file or folder in the trash instead of unlinking it: one atomic
-     *  rename, the original path remembered, nothing recursive to go wrong. */
-    public function trash(string $target): bool
-    {
-        $target = path($target);
-        if ($target === '' || !file_exists($this->abs($target))) {
-            return false;
-        }
-        /* Never take the trash itself, and never take the home root. */
-        if ($target === self::trash || str_starts_with($target, self::trash . '/')) {
-            return false;
-        }
-        if (!is_dir($this->abs(self::trash)) && !mkdir($this->abs(self::trash), 0755, true)) {
-            return false;
-        }
-        /* id is unique by time + randomness: the name the item carries in the
-           trash, so two deletes of the same filename never collide. */
-        $id = date('Ymd-His') . '-' . bin2hex(random_bytes(4)) . '-' . basename($target);
-        if (!rename($this->abs($target), $this->abs(self::trash . '/' . $id))) {
-            return false;
-        }
-        $map = $this->trashed();
-        $map[$id] = ['from' => $target, 'at' => time(), 'dir' => $this->isfolder(self::trash . '/' . $id)];
-        file_put_contents($this->manifest(), json_encode($map, JSON_PRETTY_PRINT));
-        return true;
-    }
-
-    /** The manifest, oldest first. An unreadable or absent file reads as empty. */
-    public function trashed(): array
-    {
-        $raw = @file_get_contents($this->manifest());
-        $map = $raw ? json_decode($raw, true) : [];
-        return is_array($map) ? $map : [];
-    }
-
-    /** Put one entry back where it came from. Refuses if that path is now
-     *  taken — a restore must never overwrite whatever moved in since. */
-    public function restore(string $id): bool
-    {
-        $map = $this->trashed();
-        if (!isset($map[$id])) {
-            return false;
-        }
-        $from = (string) ($map[$id]['from'] ?? '');
-        $parked = self::trash . '/' . $id;
-        if ($from === '' || !file_exists($this->abs($parked))) {
-            return false;
-        }
-        if (file_exists($this->abs($from))) {
-            return false;
-        }
-        $dest_dir = dirname($from);
-        if ($dest_dir !== '.' && !$this->isfolder($dest_dir) && !$this->create($dest_dir, true)) {
-            return false;
-        }
-        if (!rename($this->abs($parked), $this->abs($from))) {
-            return false;
-        }
-        unset($map[$id]);
-        file_put_contents($this->manifest(), json_encode($map, JSON_PRETTY_PRINT));
-        return true;
-    }
-
-    /** Destroy one entry for good, or the whole trash with $all. */
-    public function purge(?string $id = null): bool
-    {
-        $map = $this->trashed();
-        $ids = $id === null ? array_keys($map) : [$id];
-        $ok = true;
-        foreach ($ids as $one) {
-            $parked = self::trash . '/' . $one;
-            if (file_exists($this->abs($parked)) && !$this->delete($parked)) {
-                $ok = false;
-                continue;
-            }
-            unset($map[$one]);
-        }
-        file_put_contents($this->manifest(), json_encode($map, JSON_PRETTY_PRINT));
-        return $ok;
-    }
-
-    /** Delete for real — recursive unlink. The trash uses this to empty out. */
+    /** Delete for real — recursive unlink. */
     public function delete(string $target): bool
     {
         $target = path($target);
@@ -2156,14 +2342,13 @@ class fm
     {
         $folder = path($folder);
         $name = $name !== '' ? $name : 'Backup-' . date('YmdHis') . '.zip';
-        $base = $folder !== '' ? $folder . '/' : '';
         $targets = [$folder];
         if ($items !== null) {
             $targets = [];
             foreach ($items as $item) {
                 $item = path((string) $item);
                 if ($item !== '') {
-                    $targets[] = $base . $item;
+                    $targets[] = rel($folder, $item);
                 }
             }
         }
@@ -2193,7 +2378,7 @@ class fm
         if ($name === '' || !is_uploaded_file((string) ($file['tmp_name'] ?? ''))) {
             return false;
         }
-        $target = ($dir !== '' ? $dir . '/' : '') . $name;
+        $target = rel($dir, $name);
         return move_uploaded_file($file['tmp_name'], $this->abs($target));
     }
 
@@ -2270,24 +2455,20 @@ class fm
     public function info(string $item): array
     {
         $path = $this->abs(path($item));
-        $info = [];
+        $info = [
+            'perms' => intval(substr(sprintf('%o', fileperms($path)), -4)),
+            'path' => realpath($path),
+            'owner' => fileowner($path),
+            'last_accessed' => date(SIFM_DATE, fileatime($path)),
+            'last_modified' => date(SIFM_DATE, filemtime($path)),
+        ];
         if (is_file($path)) {
             $info['size'] = $this->size($item);
-            $info['last_accessed'] = date(SIFM_DATE, fileatime($path));
-            $info['last_modified'] = date(SIFM_DATE, filemtime($path));
-            $info += pathinfo($path);
-            $info['owner'] = fileowner($path);
-            $info['perms'] = intval(substr(sprintf('%o', fileperms($path)), -4));
-            $info['path'] = realpath($path);
             $info['mimetype'] = (new finfo(FILEINFO_MIME_TYPE))->file($path);
+            $info += pathinfo($path);
         } else {
-            $info['perms'] = intval(substr(sprintf('%o', fileperms($path)), -4));
             $info['basename'] = basename($path);
             $info['dirname'] = dirname($path);
-            $info['path'] = realpath($path);
-            $info['owner'] = fileowner($path);
-            $info['last_accessed'] = date(SIFM_DATE, fileatime($path));
-            $info['last_modified'] = date(SIFM_DATE, filemtime($path));
         }
         ksort($info);
         return $info;
@@ -2310,7 +2491,6 @@ class fm
             }
         }
         $units = ['B', 'KB', 'MB', 'GB'];
-        $i = 0;
         for ($i = 0; $size >= 1024 && $i < count($units) - 1; $i++) {
             $size = round($size / 1024, 2);
         }
@@ -2332,5 +2512,81 @@ class fm
         }
         $needle = mb_strtolower($q);
         return array_values(array_filter($items, fn($i) => str_contains(mb_strtolower($i), $needle)));
+    }
+
+    /** A text search through the content of the files under $folder — the
+     *  files whose text holds the needle. Big and binary files are skipped. */
+    public function grep(string $needle, string $folder = ''): array
+    {
+        $needle = trim($needle);
+        if ($needle === '') {
+            return [];
+        }
+        $hits = [];
+        foreach ($this->list($folder, true) as $file) {
+            if (count($hits) >= self::grep_files) {
+                break;
+            }
+            if (!$this->isfile($file) || (int) @filesize($this->abs($file)) > self::grep_bytes) {
+                continue;
+            }
+            $text = $this->source($file);
+            if ($text === '' || str_contains($text, "\0")) {
+                continue; // binary
+            }
+            if (stripos($text, $needle) !== false) {
+                $hits[] = $file;
+            }
+        }
+        return $hits;
+    }
+
+    /** The image tools: rotate, resize, or save a WebP beside the original.
+     *  Returns what it did, or null when the file is not an image it can open. */
+    public function image(string $file, string $op, int $width = 0): ?string
+    {
+        $path = $this->abs(path($file));
+        if (!$this->isfile($file)) {
+            return null;
+        }
+        $im = @imagecreatefromstring((string) @file_get_contents($path));
+        if ($im === false) {
+            return null;
+        }
+        if ($op === 'webp') {
+            $webp = rel(dirname($file), pathinfo($file, PATHINFO_FILENAME) . '.webp');
+            $done = imagewebp($im, $this->abs($webp), 85);
+            imagedestroy($im);
+            return $done ? 'Saved as ' . $webp . '.' : null;
+        }
+        $out = $im;
+        if ($op === 'left' || $op === 'right') {
+            $bg = imagecolorallocatealpha($im, 0, 0, 0, 127);
+            $out = imagerotate($im, $op === 'left' ? -90 : 90, $bg);
+        } elseif ($op === 'resize' && $width > 0 && $width <= 10000) {
+            $out = imagescale($im, $width);
+        } else {
+            imagedestroy($im);
+            return null;
+        }
+        if ($out === false) {
+            imagedestroy($im);
+            return null;
+        }
+        $done = match (strtolower(pathinfo($file, PATHINFO_EXTENSION))) {
+            'png' => imagepng($out, $path),
+            'gif' => imagegif($out, $path),
+            'webp' => imagewebp($out, $path, 85),
+            default => imagejpeg($out, $path, 90),
+        };
+        imagedestroy($im);
+        if ($out !== $im) {
+            imagedestroy($out);
+        }
+        return $done ? match ($op) {
+            'left' => 'Rotated 90° to the left.',
+            'right' => 'Rotated 90° to the right.',
+            default => 'Resized to ' . $width . ' px wide.',
+        } : null;
     }
 }
