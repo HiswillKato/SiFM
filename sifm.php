@@ -193,7 +193,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'copy'   => ['copy', 'Copy successful!',     'Failed to copy.',                                  fn($t) => $fm->copy($t, path(post('new')))],
             'move'   => ['move', 'Moving successful!',   'Moving failed.',                                   fn($t) => $fm->move($t, path(post('new')))],
             'rename' => ['ren',  'Renaming successful!', 'Renaming failed — no slashes in the new name.',     fn($t) => $fm->rename($t, trim(post('new')))],
-            'chmod'  => ['mod',  'Chmod successful!',    'Chmod failed — use 3–4 octal digits like 644.',      fn($t) => $fm->chmod($t, trim(post('mod')))],
+            'chmod'  => ['mod',  'Chmod successful!',    'Chmod failed — check the octal mode and PHP ownership of the item.', fn($t) => $fm->chmod($t, trim(post('mod')))],
             'delete' => ['del',  'Deletion successful!', 'Deletion failed.',                                  fn($t) => $fm->delete($t)],
             'duplicate' => ['dup', 'Duplicated!', 'Duplication failed.',                               fn($t) => $fm->copy($t, rel(dirname($t), path(post('new'))))],
         ];
@@ -2257,27 +2257,27 @@ class fm
      *  absolute path is ever built. */
     public function abs(string $path): string
     {
-        return $this->home . '/' . trim($path, '/');
+        return $this->home . '/' . path($path);
     }
 
     public function exists(string $path): bool
     {
-        return file_exists($this->abs(path($path)));
+        return file_exists($this->abs($path));
     }
 
     public function writable(string $item): bool
     {
-        return is_writable($this->abs(path($item)));
+        return is_writable($this->abs($item));
     }
 
     public function isfile(string $path): bool
     {
-        return is_file($this->abs(path($path)));
+        return is_file($this->abs($path));
     }
 
     public function isfolder(string $path): bool
     {
-        return is_dir($this->abs(path($path)));
+        return is_dir($this->abs($path));
     }
 
     /** Children of a folder (no "." / "..", hidden files kept). $deep walks
@@ -2288,7 +2288,7 @@ class fm
         if (!$this->isfolder($folder)) {
             return [];
         }
-        $items = scandir($this->abs(path($folder)));
+        $items = scandir($this->abs($folder));
         $items = $items ? array_values(array_diff($items, ['.', '..'])) : [];
         if (!$deep) {
             return $items;
@@ -2329,7 +2329,7 @@ class fm
     /** Accept an octal string or mode integer; optionally apply it recursively. */
     public function chmod(string $target, string|int $mod, bool $recursive = false): bool
     {
-        if (is_string($mod) && !preg_match('/0?[0-7]{3}$/', $mod)) {
+        if (is_string($mod) && !preg_match('/^[0-7]{3,4}$/', $mod)) {
             return false;
         }
         if (is_int($mod) && ($mod < 0 || $mod > 07777)) {
@@ -2556,7 +2556,7 @@ class fm
         if (!$this->isfile($file)) {
             return '';
         }
-        return (string) file_get_contents($this->abs(path($file)));
+        return (string) file_get_contents($this->abs($file));
     }
 
     public function read(string $file, bool $lines = false): string|array|false
@@ -2564,7 +2564,7 @@ class fm
         if (!$this->isfile($file)) {
             return false;
         }
-        $data = file_get_contents($this->abs(path($file)));
+        $data = file_get_contents($this->abs($file));
         if ($data === false || !$lines) {
             return $data;
         }
@@ -2595,7 +2595,7 @@ class fm
         if (!$this->isfile($file)) {
             return false;
         }
-        return (new finfo(FILEINFO_MIME_TYPE))->file($this->abs(path($file)));
+        return (new finfo(FILEINFO_MIME_TYPE))->file($this->abs($file));
     }
 
     public function extension(string $file): string|false
@@ -2603,7 +2603,7 @@ class fm
         if (!$this->isfile($file)) {
             return false;
         }
-        return pathinfo($this->abs(path($file)), PATHINFO_EXTENSION);
+        return pathinfo($this->abs($file), PATHINFO_EXTENSION);
     }
 
     public function permissions(string $item): string|false
@@ -2662,7 +2662,7 @@ class fm
         if (!$this->isfile($file) || !in_array($algo, hash_algos(), true)) {
             return false;
         }
-        return hash_file($algo, $this->abs(path($file)));
+        return hash_file($algo, $this->abs($file));
     }
 
     public function imageDataUri(string $file): string|false
@@ -2723,7 +2723,7 @@ class fm
     /** Size + MIME + perms + dates for the file details page and the table. */
     public function info(string $item): array
     {
-        $path = $this->abs(path($item));
+        $path = $this->abs($item);
         $info = [
             'perms' => intval(substr(sprintf('%o', fileperms($path)), -4)),
             'path' => realpath($path),
@@ -2753,7 +2753,7 @@ class fm
             $size = $bytes;
         } else {
             $item = path($item);
-            $path = $this->abs(path($item));
+            $path = $this->abs($item);
             if (is_file($path)) {
                 $size = filesize($path);
             } elseif (is_dir($path)) {
@@ -2847,7 +2847,7 @@ class fm
             $uri = $this->imageDataUri($file);
             return $uri === false ? null : $uri;
         }
-        $path = $this->abs(path($file));
+        $path = $this->abs($file);
         if (!$this->isfile($file)) {
             return null;
         }
