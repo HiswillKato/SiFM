@@ -301,7 +301,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $saved = $fresh && file_put_contents(SIFM_HOME . '/' . $file, is_string($_POST['data'] ?? null) ? $_POST['data'] : '') !== false;
             $text  = !$fresh
                 ? 'The file changed on disk since you opened it — reload to get the latest version.'
-                : ($saved ? 'Changes saved!' : 'Failed to save changes.');
+                : ($saved ? 'Saved successfully!' : 'Save failed!');
             json_out(['ok' => $saved, 'msg' => $text, 'mtime' => (int) (@filemtime(SIFM_HOME . '/' . $file))]);
             message($text, $fresh ? ($saved ? 1 : 0) : 2);
             redirect('edit', $file); // PRG: a refresh never reposts the body
@@ -430,7 +430,15 @@ if ($action === 'download') {
 }
 if ($action === 'signout') {
     session_destroy();
-    setcookie('SIFM_', '', time() - 3600, '/');
+    $cookie = session_get_cookie_params();
+    setcookie(session_name(), '', [
+        'expires' => time() - 3600,
+        'path' => $cookie['path'],
+        'domain' => $cookie['domain'],
+        'secure' => $cookie['secure'],
+        'httponly' => $cookie['httponly'],
+        'samesite' => $cookie['samesite'],
+    ]);
     redirect('signin');
 }
 
@@ -508,17 +516,26 @@ $packs = [
 ];
 $url = static fn(string $pkg, string $ver, string $extra = ''): string
     => "https://esm.sh/{$pkg}@{$ver}{$extra}";
-/* Everything that must exist exactly once, as bare specifiers. Passing this to
-   ?external= stops a package from resolving its own copy: the emitted import
-   stays bare and lands on the SAME instance my module and every other package
-   use. A grammar that resolves @lezer/highlight on its own attaches tag objects
-   from a second copy, and highlightingFor() then answers null for every node —
-   the editor mounts and shows plain text. */
+/* Everything that must exist exactly once. Passing this to ?external= stops a
+   package from resolving its own copy: the emitted import stays bare and lands
+   on the same instance my module and every other package use. This includes
+   the Lezer parser packages, whose tags must match @lezer/highlight exactly. */
 $shared = implode(',', array_keys($cm));
 $map = [];
 foreach ($cm as $pkg => $ver) {
-    $bare = in_array($pkg, ['@codemirror/state', '@lezer/highlight', '@lezer/common', '@lezer/lr', '@lezer/php'], true);
-    $map[$pkg] = $url($pkg, $ver, $bare ? '' : "?deps={$deps}&external={$shared}");
+    $dependencies = [];
+    $external = [];
+    foreach ($cm as $dependency => $dependency_version) {
+        if ($dependency !== $pkg) {
+            $dependencies[] = "{$dependency}@{$dependency_version}";
+            $external[] = $dependency;
+        }
+    }
+    $map[$pkg] = $url(
+        $pkg,
+        $ver,
+        '?deps=' . implode(',', $dependencies) . '&external=' . implode(',', $external)
+    );
 }
 foreach ($packs as $pkg => $ver) {
     $map[$pkg] = $url($pkg, $ver, "?deps={$deps}&external={$shared}");
@@ -737,6 +754,8 @@ table th, table td { white-space: pre; }
    like --bs-link-decoration), so the shadow and radius are set directly. */
 .card { --bs-card-bg: var(--surface); --bs-card-border-color: var(--bs-border-color); --bs-card-cap-bg: transparent; box-shadow: var(--bs-box-shadow-sm); border-radius: var(--bs-border-radius-lg); }
 .panel-head { display: flex; flex-wrap: wrap; gap: .6rem; align-items: center; justify-content: space-between; margin-bottom: .9rem; position: sticky; top: var(--site-head-h); z-index: 1020; background: var(--bs-body-bg); }
+#flash-toast, #editor-save-toast { position: fixed; top: 50%; left: 50%; z-index: 1091; width: min(28rem, calc(100vw - 2rem)); margin: 0; transform: translate(-50%, -50%); text-align: center; box-shadow: var(--bs-box-shadow); transition: opacity .3s ease, transform .3s ease; }
+#flash-toast.flash-toast-hide, #editor-save-toast.flash-toast-hide { opacity: 0; transform: translate(-50%, calc(-50% - .5rem)); }
 .kv { display: grid; grid-template-columns: max-content 1fr; gap: .35rem 1.2rem; }
 .kv dd { margin: 0; overflow-wrap: anywhere; }
 
@@ -1132,11 +1151,11 @@ pre.out { white-space: pre-wrap; overflow-wrap: anywhere; }
       <h2 class="h6">Replace a phrase</h2>
       <div class="mb-3">
         <label class="form-label" for="rep-from">Find</label>
-        <textarea class="form-control" id="rep-from" name="from" rows="3" required></textarea>
+        <textarea class="form-control" id="rep-from" name="from" rows="3" required<?= $replace ? '' : ' disabled' ?>></textarea>
       </div>
       <div class="mb-3">
         <label class="form-label" for="rep-to">Replace with</label>
-        <textarea class="form-control" id="rep-to" name="to" rows="3"></textarea>
+        <textarea class="form-control" id="rep-to" name="to" rows="3"<?= $replace ? '' : ' disabled' ?>></textarea>
       </div>
       <div class="d-flex gap-2">
         <button class="btn btn-primary" name="replace" value="1">Replace</button>
@@ -1156,12 +1175,15 @@ pre.out { white-space: pre-wrap; overflow-wrap: anywhere; }
   var cancel = document.getElementById('replace-cancel');
   var save = document.getElementById('save-btn');
   var from = document.getElementById('rep-from');
+  var to = document.getElementById('rep-to');
   if (!panel || !open) {
     return;
   }
   function show(on) {
     panel.classList.toggle('d-none', !on);
     open.setAttribute('aria-expanded', on ? 'true' : 'false');
+    from.disabled = !on;
+    to.disabled = !on;
     if (save) {
       save.classList.toggle('d-none', on);
     }
@@ -1171,6 +1193,64 @@ pre.out { white-space: pre-wrap; overflow-wrap: anywhere; }
   }
   open.addEventListener('click', function () { show(panel.classList.contains('d-none')); });
   cancel.addEventListener('click', function () { show(false); });
+})();
+</script>
+<script>
+(function () {
+  var button = document.getElementById('save-btn');
+  if (!button || !button.form) return;
+  var form = button.form;
+  var toastTimer, removeTimer;
+
+  function showToast(kind, text) {
+    var toast = document.getElementById('editor-save-toast');
+    if (!toast) {
+      toast = document.createElement('div');
+      toast.id = 'editor-save-toast';
+      document.body.appendChild(toast);
+    }
+    window.clearTimeout(toastTimer);
+    window.clearTimeout(removeTimer);
+    toast.className = 'alert alert-' + kind;
+    toast.setAttribute('role', 'alert');
+    toast.setAttribute('aria-live', 'assertive');
+    toast.textContent = text;
+    toastTimer = window.setTimeout(function () {
+      toast.classList.add('flash-toast-hide');
+      removeTimer = window.setTimeout(function () { toast.remove(); }, 300);
+    }, 4000);
+  }
+
+  form.addEventListener('submit', async function (event) {
+    if (!event.submitter || event.submitter.name !== 'save') return;
+    event.preventDefault();
+    var submitter = event.submitter;
+    submitter.disabled = true;
+    var data = new FormData(form);
+    data.set('data', document.getElementById('editor').value);
+    data.set('save', '1');
+    try {
+      var response = await fetch(form.action, {
+        method: 'POST',
+        body: data,
+        headers: { 'X-Requested-With': 'XMLHttpRequest' }
+      });
+      var result = await response.json();
+      if (!response.ok || typeof result.ok !== 'boolean' || typeof result.msg !== 'string') {
+        throw new Error('Invalid save response');
+      }
+      if (result.ok) {
+        var mtime = form.querySelector('[name="mtime"]');
+        if (mtime && result.mtime) mtime.value = result.mtime;
+      }
+      showToast(result.ok ? 'success' : 'danger', result.msg);
+    } catch (error) {
+      showToast('danger', 'Save failed!');
+      window.__saveErr = String(error && error.message || error);
+    } finally {
+      submitter.disabled = false;
+    }
+  });
 })();
 </script>
 <?php break; ?>
@@ -1395,9 +1475,17 @@ pre.out { white-space: pre-wrap; overflow-wrap: anywhere; }
       .then(function (d) {
         ev.submitter.disabled = false;
         bar.classList.add('d-none');
-        note.className = 'small mb-2 text-' + (d.ok ? 'success' : 'danger');
-        note.textContent = d.msg;
+        note.className = 'small text-secondary mb-2';
+        note.textContent = 'Ready for another import.';
+        window.sifmToast(d.ok ? 'success' : 'danger', d.msg);
         if (d.ok) form.reset();
+      })
+      .catch(function () {
+        ev.submitter.disabled = false;
+        bar.classList.add('d-none');
+        note.className = 'small text-secondary mb-2';
+        note.textContent = 'Ready for another import.';
+        window.sifmToast('danger', 'Import failed. Check your connection and try again.');
       });
   });
 })();
@@ -1462,7 +1550,8 @@ pre.out { white-space: pre-wrap; overflow-wrap: anywhere; }
     (function next() {
       var f = files[i++];
       if (!f) {
-        state(bad ? done + ' uploaded, ' + bad + ' failed.' : 'Uploaded ' + done + ' file(s).', bad ? 'danger' : 'success', false);
+        state('Ready for another upload.', 'secondary', false);
+        window.sifmToast(bad ? 'danger' : 'success', bad ? done + ' uploaded, ' + bad + ' failed.' : 'Uploaded ' + done + ' file(s).');
         input.value = ''; // ready for the next batch
         return;
       }
@@ -1800,31 +1889,6 @@ const style = (tags) => [
   { tag: [tags.standard(tags.variableName), tags.standard(tags.propertyName)], color: 'var(--tok-builtin)' },
 ];
 
-/* Save in place: POST through fetch, show the verdict, refresh the mtime
-   guard — the page never moves. Anything but Save posts normally. */
-const liveSave = (form) => {
-  let flash;
-  form.addEventListener('submit', (ev) => {
-    if (!ev.submitter || ev.submitter.name !== 'save') return;
-    ev.preventDefault();
-    ev.submitter.disabled = true;
-    const fd = new FormData(form);
-    fd.append('save', '1'); // FormData alone drops the submit button's pair
-    fetch(form.action, { method: 'POST', body: fd, headers: { 'X-Requested-With': 'XMLHttpRequest' } })
-      .then((r) => r.json())
-      .then((d) => {
-        ev.submitter.disabled = false;
-        const m = form.querySelector('[name=mtime]');
-        if (d.ok && m && d.mtime) m.value = d.mtime; // conflict keeps the stale mtime, so a blind retry can never overwrite
-        flash = flash || form.insertBefore(document.createElement('div'), form.firstChild);
-        flash.className = 'alert alert-' + (d.ok ? 'success' : 'danger') + ' mt-2';
-        flash.textContent = d.msg;
-        setTimeout(() => { flash.remove(); flash = null; }, 4000);
-      })
-      .catch(() => { ev.submitter.disabled = false; });
-  });
-};
-
 /* [bare specifier, exported factory] for the curated grammars, [mode file,
    parser] for the stream parsers. PHP's family comes from lang(). */
 const curated = {
@@ -1840,6 +1904,14 @@ const streams = { sh: ['shell', 'shell'], ruby: ['ruby', 'ruby'], perl: ['perl',
 const legacy = (file) => import(`https://cdn.jsdelivr.net/npm/@codemirror/legacy-modes@6.5.5/mode/${file}.js`);
 
 try {
+  if (!ta) {
+    throw new Error('Missing editor textarea');
+  }
+  const mount = document.getElementById('ed');
+  if (!mount) {
+    throw new Error('Missing editor mount node');
+  }
+
   const [state, view, language, commands, search, lezer] = await Promise.all([
     import('@codemirror/state'),
     import('@codemirror/view'),
@@ -1869,7 +1941,7 @@ try {
   }
 
   const editor = new EditorView({
-    parent: document.getElementById('ed'),
+    parent: mount,
     state: EditorState.create({
       doc: ta.value,
       extensions: [
@@ -1877,16 +1949,16 @@ try {
         EditorView.lineWrapping, EditorState.tabSize.of(4), EditorView.updateListener.of((u) => { if (u.docChanged) ta.value = u.state.doc.toString(); }),
         keymap.of([...defaultKeymap, ...historyKeymap, ...searchKeymap, indentWithTab]),
         EditorView.theme(theme(pal)), syntaxHighlighting(HighlightStyle.define(style(tags))),
+        EditorView.domEventHandlers({
+          keydown: (ev) => ((ev.ctrlKey || ev.metaKey) && ev.key === 'f' ? openSearchPanel(editor) || true : false),
+        }),
         grammar,
       ],
     }),
   });
-  liveSave(ta.form);
-
-  /* CM6 ships its own find & replace panel — Ctrl/Cmd+F opens it. */
-  EditorView.domEventHandlers({ keydown: (ev) => ((ev.ctrlKey || ev.metaKey) && ev.key === 'f' ? openSearchPanel(editor) || true : false) });
 } catch (err) {
-  document.getElementById('ed').remove();
+  const mount = document.getElementById('ed');
+  if (mount) mount.remove();
   ta.hidden = false;
   window.__err = String(err && err.stack || err); // visible to the smoke probe and DevTools
 }
@@ -1904,6 +1976,35 @@ document.querySelectorAll('pre.src code').forEach(function (el) {
 });
 </script>
 <?php endif; ?>
+<script>
+(function () {
+  var toastTimer, removeTimer;
+  window.sifmToast = function (kind, text) {
+    var toast = document.getElementById('flash-toast');
+    if (!toast) {
+      toast = document.createElement('div');
+      toast.id = 'flash-toast';
+      document.body.appendChild(toast);
+    }
+    window.clearTimeout(toastTimer);
+    window.clearTimeout(removeTimer);
+    toast.className = 'alert alert-' + kind;
+    toast.setAttribute('role', 'alert');
+    toast.setAttribute('aria-live', 'assertive');
+    toast.textContent = text;
+    toastTimer = window.setTimeout(function () {
+      toast.classList.add('flash-toast-hide');
+      removeTimer = window.setTimeout(function () { toast.remove(); }, 300);
+    }, 4000);
+  };
+  var initialToast = document.getElementById('flash-toast');
+  if (initialToast) {
+    var kind = initialToast.classList.contains('alert-success') ? 'success'
+      : (initialToast.classList.contains('alert-info') ? 'info' : 'danger');
+    window.sifmToast(kind, initialToast.textContent);
+  }
+})();
+</script>
 </body>
 </html>
 <?php
@@ -2014,7 +2115,7 @@ function message(?string $text = null, int $kind = 1): ?string
     $flash = $_SESSION['flash'] ?? null;
     unset($_SESSION['flash']);
     return $flash
-        ? '<div class="alert alert-' . $flash['class'] . ' mb-3" role="alert">' . e($flash['text']) . '</div>'
+        ? '<div id="flash-toast" class="alert alert-' . $flash['class'] . '" role="alert" aria-live="assertive">' . e($flash['text']) . '</div>'
         : null;
 }
 
@@ -2059,7 +2160,7 @@ function timeago($time): string
     $steps = [60, 60, 24, 30, 12];
     $diff = time() - $time;
     $i = 0;
-    while ($diff >= $steps[$i] && $i < count($steps) - 1) {
+    while ($i < count($steps) && $diff >= $steps[$i]) {
         $diff = (int) round($diff / $steps[$i]);
         $i++;
     }
@@ -2134,6 +2235,8 @@ function row(string $rel, bool $select, bool $full = false, ?array $meta = null)
  **** to sanitise still cannot escape the home folder. ****/
 class fm
 {
+    public string $home;
+
     /** Extensions the built-in editor accepts. */
     const edit = ["", "bat", "c", "cert", "cgi", "cpp", "css", "dat", "htaccess", "htm", "html", "ini", "js", "key", "json", "lock", "log", "md", "php", "pl", "py", "sh", "sql", "tpl", "txt", "wml", "xhtml", "xml"];
 
@@ -2144,11 +2247,17 @@ class fm
     /** Extension → FA6 icon class (json, decoded once by row()). */
     const icons = '{"7z":"fas fa-file-archive","aac":"fas fa-music","accdb":"fas fa-database","ai":"fas fa-image","aif":"fas fa-music","apk":"fab fa-android","app":"fas fa-window","avi":"fas fa-video","bak":"fas fa-save","bat":"fas fa-terminal","bmp":"fas fa-image","box":"fas fa-archive","bz":"fas fa-file-archive","c":"fas fa-code","cfg":"fas fa-file-alt","class":"fas fa-code","cmd":"fas fa-terminal","com":"fas fa-window","cpp":"fas fa-code","css":"fab fa-css3","csv":"fas fa-file-csv","db":"fas fa-database","dbf":"fas fa-database","deb":"fas fa-archive","doc":"fas fa-file-word","docx":"fas fa-file-word","drw":"fas fa-image","email":"fas fa-envelope","empty":"fas fa-file-alt","eot":"fas fa-font-case","eps":"fas fa-image","erb":"fas fa-code","exe":"fab fa-windows","flac":"fas fa-music","flv":"fas fa-video","gam":"fas fa-gamepad","gif":"fas fa-image","gz":"fas fa-file-archive","htaccess":"fas fa-server","htm":"fab fa-html5","html":"fab fa-html5","ico":"fas fa-image","ini":"fas fa-cog","iso":"fas fa-compact-disc","jar":"fas fa-window","java":"fab fa-java","jpeg":"fas fa-image","jpg":"fas fa-image","js":"fab fa-js","json":"fas fa-file-alt","lock":"fas fa-lock","log":"fas fa-file-alt","mail":"fas fa-envelope","md":"fab fa-markdown","mdb":"fas fa-database","mid":"fas fa-music","midi":"fas fa-music","mkv":"fas fa-video","mov":"fas fa-video","mp3":"fas fa-music","mp4":"fas fa-video","mpa":"fas fa-music","mpg":"fas fa-video","msg":"fas fa-envelope","msi":"fas fa-window","nes":"fas fa-gamepad","odt":"fas fa-file-alt","ogg":"fas fa-music","ogv":"fas fa-video","otf":"fas fa-font-case","pdb":"fas fa-database","pdf":"fas fa-file-pdf","php":"fab fa-php","phtml":"fab fa-html5","pl":"fas fa-code","png":"fas fa-image","ppt":"fas fa-file-powerpoint","pptx":"fas fa-file-powerpoint","ps":"fas fa-image","psd":"fas fa-image","py":"fab fa-python","rar":"fas fa-file-archive","rb":"fas fa-code","rom":"fas fa-gamepad","rpm":"fas fa-archive","rtf":"fas fa-file-alt","sav":"fas fa-save","sh":"fas fa-terminal","sql":"fas fa-database","svg":"fas fa-image","swf":"fas fa-video","tar":"fas fa-file-archive","tga":"fas fa-image","tif":"fas fa-image","tiff":"fas fa-image","ttf":"fas fa-font-case","twig":"fab fa-php","txt":"fas fa-file-alt","vb":"fas fa-window","wav":"fas fa-music","webm":"fas fa-video","wma":"fas fa-music","wmv":"fas fa-video","woff":"fas fa-font-case","xhtml":"fas fa-code","xls":"fas fa-file-excel","xlsx":"fas fa-file-excel","xml":"fas fa-code","xz":"fas fa-file-archive","yaml":"fas fa-file-alt","zip":"fas fa-file-archive"}';
 
-    /** Every path is joined to SIFM_HOME — the one place an absolute path
-     *  is ever built. */
+    public function __construct(string $path = '')
+    {
+        $home = $path !== '' && is_dir($path) ? realpath($path) : realpath(SIFM_HOME);
+        $this->home = $home === false ? SIFM_HOME : $home;
+    }
+
+    /** Every path is joined to the configured home — the one place an
+     *  absolute path is ever built. */
     public function abs(string $path): string
     {
-        return SIFM_HOME . '/' . trim($path, '/');
+        return $this->home . '/' . trim($path, '/');
     }
 
     public function exists(string $path): bool
@@ -2174,7 +2283,7 @@ class fm
     /** Children of a folder (no "." / "..", hidden files kept). $deep walks
      *  the whole tree — home-relative paths — and $folders adds the folder
      *  entries themselves, right before their contents. */
-    public function list(string $folder, bool $deep = false, bool $folders = false): array
+    public function list(string $folder = '', bool $deep = false, bool $folders = false): array
     {
         if (!$this->isfolder($folder)) {
             return [];
@@ -2199,8 +2308,14 @@ class fm
         return $out;
     }
 
-    public function create(string $name, bool $dir = false): bool
+    public function create(string $name, bool|string $dir = false): bool
     {
+        if (is_string($dir)) {
+            if (!in_array($dir, ['file', 'folder'], true)) {
+                return false;
+            }
+            $dir = $dir === 'folder';
+        }
         $name = path($name);
         if ($name === '') {
             return false;
@@ -2211,17 +2326,27 @@ class fm
         return file_exists($this->abs($name)) || file_put_contents($this->abs($name), '') !== false;
     }
 
-    /** $mod must be 3–4 octal digits ("644" or "0644"). */
-    public function chmod(string $target, string $mod): bool
+    /** Accept an octal string or mode integer; optionally apply it recursively. */
+    public function chmod(string $target, string|int $mod, bool $recursive = false): bool
     {
-        if (!preg_match('/0?[0-7]{3}$/', $mod)) {
+        if (is_string($mod) && !preg_match('/0?[0-7]{3}$/', $mod)) {
+            return false;
+        }
+        if (is_int($mod) && ($mod < 0 || $mod > 07777)) {
             return false;
         }
         $target = path($target);
         if ($target === '' || !file_exists($this->abs($target))) {
             return false;
         }
-        return chmod($this->abs($target), intval($mod, 8));
+        $mode = is_int($mod) ? $mod : intval($mod, 8);
+        $ok = true;
+        if ($recursive && $this->isfolder($target)) {
+            foreach ($this->list($target, true, true) as $item) {
+                $ok = chmod($this->abs($item), $mode) && $ok;
+            }
+        }
+        return chmod($this->abs($target), $mode) && $ok;
     }
 
     /** The folder that will hold a file — created when it is missing.
@@ -2235,7 +2360,7 @@ class fm
     {
         $from = path($from);
         $to = path($to);
-        if ($from === '' || $to === '') {
+        if ($from === '' || $to === '' || $from === $to || str_starts_with($to, $from . '/')) {
             return false;
         }
         if ($this->isfolder($from)) {
@@ -2314,8 +2439,9 @@ class fm
     }
 
     /** Write $paths (home-relative) into zip $out. Empty folders are kept. */
-    public function zip(array $paths, string $out): bool
+    public function zip(array|string $paths, string $out): bool
     {
+        $paths = is_array($paths) ? $paths : [$paths];
         $out = path($out);
         if ($out === '') {
             return false;
@@ -2362,13 +2488,38 @@ class fm
     public function extract(string $file, string $dest = ''): bool
     {
         $file = path($file);
+        $dest = path($dest);
         $zip = new ZipArchive();
         if ($file === '' || $zip->open($this->abs($file)) !== true) {
             return false;
         }
-        $ok = $zip->extractTo($this->abs(path($dest)));
+        for ($i = 0; $i < $zip->numFiles; $i++) {
+            $name = $zip->getNameIndex($i);
+            $entry = str_replace('\\', '/', (string) $name);
+            $opsys = 0;
+            $attributes = 0;
+            $zip->getExternalAttributesIndex($i, $opsys, $attributes);
+            $mode = ($attributes >> 16) & 0170000;
+            if ($name === false || $entry === '' || str_starts_with($entry, '/')
+                || preg_match('/^[A-Za-z]:\//', $entry)
+                || in_array('..', explode('/', $entry), true)
+                || str_contains($entry, "\0") || $mode === 0120000) {
+                $zip->close();
+                return false;
+            }
+        }
+        if ($dest !== '' && !$this->ensure($dest)) {
+            $zip->close();
+            return false;
+        }
+        $ok = $zip->extractTo($this->abs($dest));
         $zip->close();
         return $ok;
+    }
+
+    public function unzip(string $file, string $dest): bool
+    {
+        return $this->extract($file, $dest);
     }
 
     public function upload(array $file, string $dir): bool
@@ -2383,15 +2534,17 @@ class fm
     }
 
     /** Stream a file to the browser and stop. */
-    public function download(string $file): void
+    public function download(string $file, string $as = ''): void
     {
         $file = path($file);
         if ($file === '' || !$this->isfile($file)) {
             message('File not found.', 0);
             redirect('folder');
         }
+        $name = basename($as !== '' ? $as : $file);
+        $name = str_replace(['"', "\r", "\n"], '', $name);
         header('Content-Type: application/octet-stream');
-        header('Content-Disposition: attachment; filename="' . str_replace(['"', "\r", "\n"], '', basename($file)) . '"');
+        header('Content-Disposition: attachment; filename="' . $name . '"');
         header('Content-Length: ' . filesize($this->abs($file)));
         header('Cache-Control: no-store');
         readfile($this->abs($file));
@@ -2404,6 +2557,122 @@ class fm
             return '';
         }
         return (string) file_get_contents($this->abs(path($file)));
+    }
+
+    public function read(string $file, bool $lines = false): string|array|false
+    {
+        if (!$this->isfile($file)) {
+            return false;
+        }
+        $data = file_get_contents($this->abs(path($file)));
+        if ($data === false || !$lines) {
+            return $data;
+        }
+        return preg_split('/\R/', $data) ?: [];
+    }
+
+    public function write(string $file, string $data = ''): bool
+    {
+        $file = path($file);
+        if ($file === '' || !$this->isfolder(dirname($file))) {
+            return false;
+        }
+        return file_put_contents($this->abs($file), $data, LOCK_EX) !== false;
+    }
+
+    public function folder(string $path): bool
+    {
+        return $this->isfolder($path);
+    }
+
+    public function file(string $path): bool
+    {
+        return $this->isfile($path);
+    }
+
+    public function mime(string $file): string|false
+    {
+        if (!$this->isfile($file)) {
+            return false;
+        }
+        return (new finfo(FILEINFO_MIME_TYPE))->file($this->abs(path($file)));
+    }
+
+    public function extension(string $file): string|false
+    {
+        if (!$this->isfile($file)) {
+            return false;
+        }
+        return pathinfo($this->abs(path($file)), PATHINFO_EXTENSION);
+    }
+
+    public function permissions(string $item): string|false
+    {
+        $item = path($item);
+        $perms = $item === '' || !$this->exists($item) ? false : fileperms($this->abs($item));
+        return $perms === false ? false : substr(sprintf('%o', $perms), -4);
+    }
+
+    public function modified(string $item): int|false
+    {
+        $item = path($item);
+        if ($item === '' || !$this->exists($item)) {
+            return false;
+        }
+        $time = filemtime($this->abs($item));
+        return $time === false ? false : $time;
+    }
+
+    public function disk(): array|false
+    {
+        $total = disk_total_space($this->home);
+        $free = disk_free_space($this->home);
+        if ($total === false || $free === false) {
+            return false;
+        }
+        return [
+            'total' => $this->size('', (int) $total),
+            'free' => $this->size('', (int) $free),
+            'used' => $this->size('', (int) ($total - $free)),
+        ];
+    }
+
+    public function link(string $target, string $link): bool
+    {
+        $target = path($target);
+        $link = path($link);
+        if ($target === '' || $link === '' || !$this->exists($target) || $this->exists($link)) {
+            return false;
+        }
+        $home = realpath($this->home);
+        $targetPath = realpath($this->abs($target));
+        $linkPath = $this->abs($link);
+        $linkParent = realpath(dirname($linkPath));
+        if ($home === false || $targetPath === false || $linkParent === false
+            || ($targetPath !== $home && !str_starts_with($targetPath, $home . DIRECTORY_SEPARATOR))
+            || ($linkParent !== $home && !str_starts_with($linkParent, $home . DIRECTORY_SEPARATOR))
+            || file_exists($linkPath) || is_link($linkPath)) {
+            return false;
+        }
+        return symlink($targetPath, $linkParent . DIRECTORY_SEPARATOR . basename($linkPath));
+    }
+
+    public function hash(string $file, string $algo = 'sha256'): string|false
+    {
+        if (!$this->isfile($file) || !in_array($algo, hash_algos(), true)) {
+            return false;
+        }
+        return hash_file($algo, $this->abs(path($file)));
+    }
+
+    public function imageDataUri(string $file): string|false
+    {
+        $data = $this->read($file);
+        $mime = $this->mime($file);
+        if (!is_string($data) || $mime === false || !str_starts_with($mime, 'image/')) {
+            return false;
+        }
+        return 'data:' . $mime . ';base64,' . base64_encode($data);
     }
 
     /** Fetch an http(s) URL into a home-relative destination. Other schemes
@@ -2474,29 +2743,58 @@ class fm
         return $info;
     }
 
-    /** Human-readable size, 2 dp ("1.21 MB", "512 B"). $bytes skips the stat. */
-    public function size(string $item, int $bytes = 0): string
+    /** Human-readable size, 2 dp; accepts raw bytes or the legacy raw-size flag. */
+    public function size(string|int $item, int|bool|null $bytes = null): string|int|false
     {
-        if ($bytes) {
+        $human = $bytes !== false;
+        if (is_int($item)) {
+            $size = $item;
+        } elseif (is_int($bytes)) {
             $size = $bytes;
         } else {
+            $item = path($item);
             $path = $this->abs(path($item));
             if (is_file($path)) {
                 $size = filesize($path);
-            } else {
+            } elseif (is_dir($path)) {
                 $size = 0;
                 foreach ($this->list($item, true) as $file) {
                     $size += (int) filesize($this->abs($file));
                 }
+            } else {
+                return false;
             }
         }
-        $units = ['B', 'KB', 'MB', 'GB'];
+        if (!$human) {
+            return $size;
+        }
+        $units = ['B', 'KB', 'MB', 'GB', 'TB'];
         for ($i = 0; $size >= 1024 && $i < count($units) - 1; $i++) {
             $size = round($size / 1024, 2);
         }
         return $size . ' ' . $units[$i];
     }
 
+    public function zipinfo(string $file): array|false
+    {
+        $file = path($file);
+        if ($file === '' || !$this->isfile($file)) {
+            return false;
+        }
+        $zip = new ZipArchive();
+        if ($zip->open($this->abs($file)) !== true) {
+            return false;
+        }
+        $info = [];
+        for ($i = 0; $i < $zip->numFiles; $i++) {
+            $entry = $zip->statIndex($i);
+            if ($entry !== false) {
+                $info[] = $entry;
+            }
+        }
+        $zip->close();
+        return $info;
+    }
     /** Keyword (substring) or wildcard (* ?) search of a subtree — returns
      *  files AND folders, home-relative. Case-insensitive. */
     public function search(string $q, string $folder = ''): array
@@ -2543,8 +2841,12 @@ class fm
 
     /** The image tools: rotate, resize, or save a WebP beside the original.
      *  Returns what it did, or null when the file is not an image it can open. */
-    public function image(string $file, string $op, int $width = 0): ?string
+    public function image(string $file, ?string $op = null, int $width = 0): ?string
     {
+        if ($op === null) {
+            $uri = $this->imageDataUri($file);
+            return $uri === false ? null : $uri;
+        }
         $path = $this->abs(path($file));
         if (!$this->isfile($file)) {
             return null;
